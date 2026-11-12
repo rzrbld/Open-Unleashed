@@ -11,10 +11,9 @@ members = [
     "crates/nfs-net",
     "crates/nfs-game",
     "crates/open-unleashed",
+    "crates/winit-sdl2",
     "tools/asset-inspector",
     "tools/asset-extractor",
-    "tools/track-viewer",
-    "tools/car-viewer",
     "tools/format-dumper",
 ]
 
@@ -43,14 +42,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-winit = "0.30"
+# ReNFS5: the game's winit calls go to a winit-compatible layer over the firmware's SDL2
+# (window, keyboard, mouse, GLES / Vulkan context); the viewers in tools/ that need the real winit are left out
+winit = { package = "winit-sdl2", path = "crates/winit-sdl2" }
+sdl2-sys = "0.38"
 wgpu = "30"
 pollster = "1"
-# controllers: SDL3 built from the source `sdl3-src` ships and linked statically (zlib); only the joystick /
-# gamepad / haptic side (with HIDAPI, power and sensors, which the gamepad code uses) — no audio, video, GPU,
-# render, camera, dialog or tray, so no window and no focus change.
-# Raw sdl3-sys (no `sdl3` wrapper): the input layer needs a dozen calls
-sdl3-sys = { version = "0.7", features = ["build-from-source-static", "debug-impls", "sdl-unix-console-build", "no-sdl-audio", "no-sdl-video", "no-sdl-gpu", "no-sdl-render", "no-sdl-camera", "no-sdl-dialog", "no-sdl-tray"] }
+# ReNFS5: controllers, haptics and (optionally) audio go through the firmware's SDL2 as well;
+# a second, static SDL (SDL3) in the same process would clash with it
 cpal = "0.18"
 libm = "0.2"
 

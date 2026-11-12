@@ -1,0 +1,20 @@
+[package]
+name = "winit-sdl2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The subset of the winit 0.30 API the game uses, implemented over the firmware's SDL2 (ReNFS5 handheld port)"
+
+[lib]
+name = "winit"
+path = "src/lib.rs"
+
+[dependencies]
+sdl2-sys.workspace = true
+smol_str = "0.2"
+bitflags = "2"
+tracing.workspace = true
+
+[features]
+# winit's keyboard.rs names it; this layer has no serde support
+serde = []

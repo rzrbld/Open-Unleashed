@@ -6,5 +6,5 @@ license.workspace = true
 
 [dependencies]
 winit.workspace = true
-sdl3-sys.workspace = true
+sdl2-sys.workspace = true
 tracing.workspace = true
