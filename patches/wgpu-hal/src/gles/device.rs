@@ -688,7 +688,9 @@ impl crate::Device for super::Device {
                 }
             }
             // TODO: may also be required for other calls involving `buffer_sub_data_u8_slice` (e.g. copy buffer to buffer and clear buffer)
-            if desc.usage.intersects(wgt::BufferUses::QUERY_RESOLVE) {
+            // ReNFS5: COPY_DST too, so the application can `glBufferSubData` into it (immutable
+            // storage without this bit refuses the write with GL_INVALID_OPERATION)
+            if desc.usage.intersects(wgt::BufferUses::QUERY_RESOLVE | wgt::BufferUses::COPY_DST) {
                 map_flags |= glow::DYNAMIC_STORAGE_BIT;
             }
             unsafe { gl.buffer_storage(target, raw_size, None, map_flags) };

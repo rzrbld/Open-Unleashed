@@ -404,6 +404,14 @@ pub struct Buffer {
     drop_guard: Option<Arc<crate::DropGuard>>,
 }
 
+impl Buffer {
+    /// ReNFS5: the GL buffer name (`None` for a buffer emulated in host memory), for a direct
+    /// `glBufferSubData` by the application.
+    pub fn raw_gl(&self) -> Option<glow::Buffer> {
+        self.raw
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BufferMapState {
     /// True if the GL buffer is actually mapped, i.e. not "fake-mapped" with

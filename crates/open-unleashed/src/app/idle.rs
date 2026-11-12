@@ -54,6 +54,11 @@ impl App {
         let user = nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0);
         // PORT-DEVIATION D45 (RE/notes/PORT-DEVIATIONS.md): a race whose window is hidden presents at most 30 fps
         let hidden = self.vehicle.is_some() && self.window_hidden();
+        // ReNFS5: say when the hidden-window cap engages (it must never on a handheld)
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if hidden && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(occluded = self.occluded, "race frame cap 30 fps: the window counts as hidden");
+        }
         let Some(want) = frame_floor(user, hidden) else { return };
         let spent = self.last_frame.elapsed();
         if spent < want {

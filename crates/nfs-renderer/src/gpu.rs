@@ -284,6 +284,15 @@ pub(crate) struct Core {
     /// the objects and the sprite vertices of the pass being encoded, built here and copied into
     /// the belt (wgpu's mapped views are write-only), kept between frames
     object_scratch: Vec<ObjectUniform>,
+    /// ReNFS5: the objects in a uniform buffer, a window bound per draw (no vertex-stage storage buffers)
+    object_uniform: bool,
+    object_bytes: Vec<u8>,
+    /// ReNFS5: the object buffers not written this time (see `make_objects`)
+    object_ring: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// ReNFS5 (GL): spare sprite vertex buffers, rotated per write like `object_ring`
+    sprite_ring: Vec<wgpu::Buffer>,
+    /// ReNFS5 (GL): a dynamic mesh's spare vertex buffers and its vertex bytes, rotated per write
+    dyn_ring: std::collections::HashMap<u32, (Vec<wgpu::Buffer>, u64)>,
     sprite_scratch: Vec<SpriteVertex>,
     /// the last submission of each of the frames still in flight, oldest first, and the newest
     /// submission of the frame being built ([`Self::frame_begin`])
@@ -379,6 +388,15 @@ const MAX_SPRITES: u64 = 8192;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_OBJECTS: u64 = 8192;
+/// ReNFS5: without storage buffers in the vertex stage (GLES drivers such as the Mali-G31 blob), the
+/// objects sit in a uniform buffer at this stride (the 304-byte object padded to the 32-byte offset
+/// alignment GLES drivers ask for) and each draw binds a window of [`OBJECT_WINDOW`] of them
+const OBJECT_UNIFORM_STRIDE: u64 = 320;
+/// objects in one uniform window: 16 KiB, GLES's guaranteed uniform block size, over the stride
+const OBJECT_WINDOW: u32 = (16384 / OBJECT_UNIFORM_STRIDE) as u32;
+/// ReNFS5: spare object buffers on GL — a frame writes its objects up to twice (the mirror's pass, the
+/// main view) and up to two frames are in flight (`NFS_OBJECT_RING` overrides)
+const OBJECT_RING: usize = 5;
 /// The staging belt's chunk: larger than the biggest single frame upload of an ordinary scene.
 const BELT_CHUNK: u64 = 1 << 22;
 /// PORT-DEVIATION D46 (photo mode): the most pixels a still has (an 8-bit target, its depth and the read-back buffer of
@@ -479,8 +497,8 @@ impl Core {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: render_scaled(size.width, surface.is_gl()),
+            height: render_scaled(size.height, surface.is_gl()),
             present_mode,
             alpha_mode,
             view_formats: vec![],
@@ -491,9 +509,15 @@ impl Core {
         surface.configure(&device, &config);
         let depth_view = Self::make_depth(&device, &config);
 
+        // ReNFS5: `NFS_OBJECT_UNIFORM=1` forces the uniform path (to test it on a desktop GPU)
+        let object_uniform = !adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
+            || std::env::var("NFS_OBJECT_UNIFORM").is_ok_and(|v| v.trim() == "1");
+        if object_uniform {
+            tracing::info!(window = OBJECT_WINDOW, "no vertex-stage storage buffers: objects in a uniform buffer, a window a draw");
+        }
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mesh shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(if object_uniform { object_uniform_shader().into() } else { include_str!("shader.wgsl").into() }),
         });
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
@@ -539,10 +563,18 @@ impl Core {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 // every object of a pass in one buffer, indexed by `instance_index`
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ObjectUniform>() as u64),
+                ty: if object_uniform {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(OBJECT_UNIFORM_STRIDE * OBJECT_WINDOW as u64),
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ObjectUniform>() as u64),
+                    }
                 },
                 count: None,
             }],
@@ -763,24 +795,36 @@ impl Core {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
             ],
         });
-        let object_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("objects"),
-            size: std::mem::size_of::<ObjectUniform>() as u64 * MAX_OBJECTS,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let object_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("objects"),
-            layout: &object_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &object_buf,
-                    offset: 0,
-                    size: None,
-                }),
-            }],
-        });
+        // ReNFS5: a ring of object buffers, each frame's objects written into one the GPU is done
+        // with — a write into a buffer still in use makes a GLES driver (Mali) copy or wait on it
+        let make_objects = || {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("objects"),
+                size: if object_uniform { OBJECT_UNIFORM_STRIDE * (MAX_OBJECTS + OBJECT_WINDOW as u64) } else { std::mem::size_of::<ObjectUniform>() as u64 * MAX_OBJECTS },
+                usage: if object_uniform { wgpu::BufferUsages::UNIFORM } else { wgpu::BufferUsages::STORAGE } | wgpu::BufferUsages::COPY_DST,
+                // made mapped and unmapped at once: wgpu then counts it as initialised and never
+                // zero-fills it under the GL backend's direct writes (`gl_write_buffer`)
+                mapped_at_creation: true,
+            });
+            buf.unmap();
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("objects"),
+                layout: &object_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buf,
+                        offset: 0,
+                        size: if object_uniform { wgpu::BufferSize::new(OBJECT_UNIFORM_STRIDE * OBJECT_WINDOW as u64) } else { None },
+                    }),
+                }],
+            });
+            (buf, bg)
+        };
+        let (object_buf, object_bg) = make_objects();
+        // the GL backend only (Vulkan / Metal / D3D12 order the copy after the GPU's reads themselves)
+        let ring_len = if surface.is_gl() { std::env::var("NFS_OBJECT_RING").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(OBJECT_RING) } else { 0 };
+        let object_ring: Vec<(wgpu::Buffer, wgpu::BindGroup)> = (0..ring_len).map(|_| make_objects()).collect();
         // A texture's own state block (0x5379D0, `RE/notes/thrash.md` §7) asks for linear
         // magnification and minification (Thrash 7 = 1 → `MAG`/`MINFILTER` `LINEAR`), and a mip
         // filter that is `POINT` for a texture with mips (0x44D571…0x44D587) and becomes `LINEAR`
@@ -876,7 +920,14 @@ impl Core {
             make_sprite_pipeline("sprite greaterequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::GreaterEqual)),
         ];
         let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
-        let sprite_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sprites"), size: MAX_SPRITES * 6 * std::mem::size_of::<SpriteVertex>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let make_sprites = || {
+            // mapped at creation: counted as initialised (see `make_objects`)
+            let b = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sprites"), size: MAX_SPRITES * 6 * std::mem::size_of::<SpriteVertex>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true });
+            b.unmap();
+            b
+        };
+        let sprite_buf = make_sprites();
+        let sprite_ring: Vec<wgpu::Buffer> = (0..ring_len).map(|_| make_sprites()).collect();
         let mut r = Self {
             surface,
             _instance: instance,
@@ -910,6 +961,9 @@ impl Core {
             sprite_sampler,
             object_buf,
             object_bg,
+            object_ring,
+            sprite_ring,
+            dyn_ring: std::collections::HashMap::new(),
             meshes: Vec::new(),
             arena: None,
             textures: Vec::new(),
@@ -932,6 +986,8 @@ impl Core {
             lens_done: Vec::new(),
             lens_staged: Vec::new(),
             object_scratch: Vec::new(),
+            object_uniform,
+            object_bytes: Vec::new(),
             sprite_scratch: Vec::new(),
             frames_in_flight: std::collections::VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 1),
             last_submit: None,
@@ -1135,8 +1191,8 @@ impl Core {
         if width == 0 || height == 0 {
             return;
         }
-        self.config.width = width;
-        self.config.height = height;
+        self.config.width = render_scaled(width, self.surface.is_gl());
+        self.config.height = render_scaled(height, self.surface.is_gl());
         self.surface.configure(&self.device, &self.config);
         self.depth_view = Self::make_depth(&self.device, &self.config);
     }
@@ -1167,7 +1223,15 @@ impl Core {
         let serial = self.buffer_serial;
         self.buffer_serial += 1;
         self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, vb_serial: serial, ib_serial: serial, writes: 0 });
-        MeshId(self.meshes.len() as u32 - 1)
+        let id = self.meshes.len() as u32 - 1;
+        // ReNFS5 (GL): spare copies, so a frame's rewrite never lands in a buffer the GPU still reads
+        if !self.object_ring.is_empty() {
+            let spares = (0..self.object_ring.len())
+                .map(|_| self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dynamic mesh vb"), contents: bytemuck::cast_slice(&mesh.vertices), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST }))
+                .collect();
+            self.dyn_ring.insert(id, (spares, std::mem::size_of_val(mesh.vertices.as_slice()) as u64));
+        }
+        MeshId(id)
     }
 
     /// Queue a vertex write for the next frame's encoder (`flush_mesh_writes`); empty writes are
@@ -1184,6 +1248,20 @@ impl Core {
     /// Record the queued vertex writes into `encoder`, from the staging belt, in call order.
     fn flush_mesh_writes(&mut self, encoder: &mut wgpu::CommandEncoder) {
         for w in &self.pending_writes {
+            // ReNFS5 (GL): a dynamic mesh rewritten whole goes into its next spare buffer, directly
+            if let Some((ring, full)) = self.dyn_ring.get_mut(&w.mesh)
+                && w.len as u64 >= *full
+                && !ring.is_empty()
+            {
+                let m = &mut self.meshes[w.mesh as usize];
+                let next = ring.remove(0);
+                ring.push(std::mem::replace(&mut m.vertex_buf, next));
+                m.vb_serial = self.buffer_serial;
+                self.buffer_serial += 1;
+                if self.surface.gl_write_buffer(&self.device, &m.vertex_buf, 0, &self.pending_bytes[w.start..w.start + w.len]) {
+                    continue;
+                }
+            }
             let size = wgpu::BufferSize::new(w.len as u64).expect("non-empty write");
             let m = &self.meshes[w.mesh as usize];
             self.belt.write_buffer(encoder, &m.vertex_buf, m.vertex_offset, size).copy_from_slice(&self.pending_bytes[w.start..w.start + w.len]);
@@ -1834,7 +1912,12 @@ impl Core {
                 st.ib = mesh.ib_serial;
             }
             let first_index = (mesh.index_offset / 4) as u32;
-            pass.draw_indexed(first_index..first_index + mesh.index_count, (mesh.vertex_offset / VERTEX_STRIDE) as i32, r.first..r.first + r.count);
+            let base = (mesh.vertex_offset / VERTEX_STRIDE) as i32;
+            if self.object_uniform {
+                self.draw_windows(pass, r, |pass, inst| pass.draw_indexed(first_index..first_index + mesh.index_count, base, inst));
+                return;
+            }
+            pass.draw_indexed(first_index..first_index + mesh.index_count, base, r.first..r.first + r.count);
             return;
         }
         if st.mesh != r.mesh {
@@ -1842,7 +1925,24 @@ impl Core {
             pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
             st.mesh = r.mesh;
         }
+        if self.object_uniform {
+            self.draw_windows(pass, r, |pass, inst| pass.draw_indexed(0..mesh.index_count, 0, inst));
+            return;
+        }
         pass.draw_indexed(0..mesh.index_count, 0, r.first..r.first + r.count);
+    }
+
+    /// ReNFS5 (uniform objects): the run's instances a window at a time — the window bound at its
+    /// first object, the instances numbered from 0 inside it.
+    fn draw_windows(&self, pass: &mut wgpu::RenderPass<'_>, r: &Run, mut draw: impl FnMut(&mut wgpu::RenderPass<'_>, std::ops::Range<u32>)) {
+        let mut done = 0;
+        while done < r.count {
+            let n = (r.count - done).min(OBJECT_WINDOW);
+            let offset = ((r.first + done) as u64 * OBJECT_UNIFORM_STRIDE) as u32;
+            pass.set_bind_group(1, &self.object_bg, &[offset]);
+            draw(pass, 0..n);
+            done += n;
+        }
     }
 
     /// Draw `scene` into `view` / `depth_view`: the 3-D items (sky, opaque, blended), then — when
@@ -1953,7 +2053,29 @@ impl Core {
                     sky_on: [sky_tex_of(&self.materials, self.no_reflections, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, item.fog_w, 0.0],
                 };
             }
-            self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&objects));
+            if !self.object_ring.is_empty() {
+                let next = self.object_ring.remove(0);
+                let (b, g) = (std::mem::replace(&mut self.object_buf, next.0), std::mem::replace(&mut self.object_bg, next.1));
+                self.object_ring.push((b, g));
+            }
+            if self.object_uniform {
+                // the same objects at the uniform stride
+                let stride = OBJECT_UNIFORM_STRIDE as usize;
+                let mut bytes = std::mem::take(&mut self.object_bytes);
+                bytes.clear();
+                bytes.resize(n * stride, 0);
+                for (i, o) in objects.iter().enumerate() {
+                    bytes[i * stride..i * stride + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(o));
+                }
+                // ReNFS5: on GL straight into the ring's buffer (no staging copy)
+                if !self.surface.gl_write_buffer(&self.device, &self.object_buf, 0, &bytes) {
+                    let size = wgpu::BufferSize::new(bytes.len() as u64).expect("objects size");
+                    self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size).copy_from_slice(&bytes);
+                }
+                self.object_bytes = bytes;
+            } else if !(!self.object_ring.is_empty() && self.surface.gl_write_buffer(&self.device, &self.object_buf, 0, bytemuck::cast_slice(&objects))) {
+                self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&objects));
+            }
             self.object_scratch = objects;
         }
 
@@ -1972,7 +2094,17 @@ impl Core {
             for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
                 verts[i * 6..i * 6 + 6].copy_from_slice(&sprite_quad(sp, aspect));
             }
-            self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&verts));
+            // ReNFS5 (GL): into the next buffer of the ring, directly
+            let mut direct = false;
+            if !self.sprite_ring.is_empty() {
+                let next = self.sprite_ring.remove(0);
+                let old = std::mem::replace(&mut self.sprite_buf, next);
+                self.sprite_ring.push(old);
+                direct = self.surface.gl_write_buffer(&self.device, &self.sprite_buf, 0, bytemuck::cast_slice(&verts));
+            }
+            if !direct {
+                self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&verts));
+            }
             self.sprite_scratch = verts;
         }
 
@@ -2001,7 +2133,9 @@ impl Core {
             multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.object_bg, &[]);
+            if !self.object_uniform {
+                pass.set_bind_group(1, &self.object_bg, &[]);
+            }
             let mut st = DrawState::NONE;
             self.draw_bucket(&mut pass, scene, &buckets[0], &mut st, white);
             drop(pass);
@@ -2026,7 +2160,9 @@ impl Core {
             multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.object_bg, &[]);
+            if !self.object_uniform {
+                pass.set_bind_group(1, &self.object_bg, &[]);
+            }
             let mut st = DrawState::NONE;
             for bucket in &buckets[..3] {
                 self.draw_bucket(&mut pass, scene, bucket, &mut st, white);
@@ -2053,7 +2189,9 @@ impl Core {
             multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.object_bg, &[]);
+            if !self.object_uniform {
+                pass.set_bind_group(1, &self.object_bg, &[]);
+            }
             let mut st = DrawState::NONE;
             self.draw_bucket(&mut pass, scene, &buckets[3], &mut st, white);
         }
@@ -2316,4 +2454,26 @@ mod adapter_choice_tests {
         assert!(!prefer_dx12_over(0x10de, D::DiscreteGpu, B::Vulkan)); // NVIDIA
         assert!(!prefer_dx12_over(0x1002, D::IntegratedGpu, B::Vulkan)); // AMD APU
     }
+}
+
+/// ReNFS5: the mesh shader with its objects in a uniform array (see [`OBJECT_UNIFORM_STRIDE`]).
+fn object_uniform_shader() -> String {
+    let src = include_str!("shader.wgsl");
+    let decl = "@group(1) @binding(0) var<storage, read> objects: array<Object>;";
+    assert!(src.contains(decl), "shader.wgsl: objects declaration changed");
+    let pad = (OBJECT_UNIFORM_STRIDE as usize - std::mem::size_of::<ObjectUniform>()) / 16;
+    src.replace(
+        decl,
+        &format!("struct ObjectSlot {{ o: Object, pad: array<vec4<f32>, {pad}> }};\n@group(1) @binding(0) var<uniform> objects: array<ObjectSlot, {OBJECT_WINDOW}>;"),
+    )
+    .replace("objects[inst];", "objects[inst].o;")
+    .replace("objects[in.obj];", "objects[in.obj].o;")
+}
+
+/// ReNFS5 (GL): `NFS_RENDER_SCALE` (0.5…1) draws the frame at that fraction of the window's size;
+/// the copy onto the window scales it up (`sdl_target.rs`). 1 by default.
+fn render_scaled(px: u32, gl: bool) -> u32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let s = *SCALE.get_or_init(|| std::env::var("NFS_RENDER_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()).map_or(1.0, |v| v.clamp(0.5, 1.0)));
+    if !gl || s >= 1.0 { px.max(1) } else { ((px as f32 * s).round() as u32).max(1) }
 }

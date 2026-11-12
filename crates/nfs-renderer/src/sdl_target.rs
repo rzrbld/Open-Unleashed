@@ -236,13 +236,37 @@ impl Target {
                     gl.color_mask(true, true, true, true);
                     // wgpu's GL images are upside down (its shaders flip y): the copy flips them back,
                     // as wgpu's own GL surface does
-                    gl.blit_framebuffer(0, h, w, 0, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+                    // the window's own size: a frame drawn smaller (`NFS_RENDER_SCALE`) is scaled up here
+                    let win = g.window.inner_size();
+                    let (ww, wh) = (win.width as i32, win.height as i32);
+                    let filter = if (ww, wh) == (w, h) { glow::NEAREST } else { glow::LINEAR };
+                    gl.blit_framebuffer(0, h, w, 0, 0, 0, ww, wh, glow::COLOR_BUFFER_BIT, filter);
                     gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
                 }
                 g.window.gl_swap();
             }
             _ => unreachable!("frame of another target"),
         }
+    }
+
+    /// GL: write `bytes` into `buffer` at `offset` now, with `glBufferSubData` (no staging copy). The
+    /// caller makes sure no submitted work still reads that range. `false` when not on GL (or the
+    /// buffer has no GL name) — the caller then writes it the wgpu way.
+    pub fn gl_write_buffer(&self, device: &wgpu::Device, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) -> bool {
+        if !self.is_gl() || bytes.is_empty() {
+            return false;
+        }
+        // SAFETY: GL objects of this context, on the thread it is current on
+        unsafe {
+            let Some(raw) = buffer.as_hal::<wgpu::hal::api::Gles>().and_then(|b| b.raw_gl()) else { return false };
+            let Some(hal_dev) = device.as_hal::<wgpu::hal::api::Gles>() else { return false };
+            let gl = hal_dev.context().lock();
+            use glow::HasContext;
+            gl.bind_buffer(glow::COPY_WRITE_BUFFER, Some(raw));
+            gl.buffer_sub_data_u8_slice(glow::COPY_WRITE_BUFFER, offset as i32, bytes);
+            gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
+        }
+        true
     }
 
     /// GL: make the context current on this thread (`true`) or let it go (`false`), for the hand-over

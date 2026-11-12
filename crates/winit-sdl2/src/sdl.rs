@@ -304,6 +304,11 @@ impl Window {
     pub fn is_minimized(&self) -> Option<bool> {
         // SAFETY: a live window
         let f = unsafe { sys::SDL_GetWindowFlags(self.raw()) };
+        // a fullscreen handheld window is always on screen (the Mali fbdev driver leaves it flagged
+        // HIDDEN, which held races at the engine's 30 fps hidden-window cap)
+        if self.shared.fullscreen {
+            return Some(false);
+        }
         Some(f & (sys::SDL_WindowFlags::SDL_WINDOW_MINIMIZED as u32 | sys::SDL_WindowFlags::SDL_WINDOW_HIDDEN as u32) != 0 && self.shared.visible)
     }
 
