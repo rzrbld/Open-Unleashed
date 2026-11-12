@@ -404,9 +404,18 @@ impl MadTables {
         if let Ok(d) = std::fs::read(root.join(Self::FILE)) {
             return Self::from_bytes(&d);
         }
-        let exe = std::fs::read(root.join("nfs5.exe"))
-            .map_err(|_| FormatError::Truncated { what: "nfs5.exe", offset: 0, needed: 1 })?;
-        Self::from_exe(&exe)
+        // ReNFS5: v3.2 installs name the executable `Porsche.exe`; its tables sit at the same
+        // addresses as v3.5's `nfs5.exe` (checked: the quantiser matrix at 0x5BED70 in both)
+        let mut last = FormatError::Truncated { what: "nfs5.exe", offset: 0, needed: 1 };
+        for name in ["nfs5.exe", "Porsche.exe", "porsche.exe", "PORSCHE.EXE"] {
+            if let Ok(exe) = std::fs::read(root.join(name)) {
+                match Self::from_exe(&exe) {
+                    Ok(t) => return Ok(t),
+                    Err(e) => last = e,
+                }
+            }
+        }
+        Err(last)
     }
 }
 

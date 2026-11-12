@@ -741,6 +741,7 @@ impl Gamepads {
                     // the front end's pad keys (D10): a standard pad's d-pad, A and B, and the left
                     // stick past 0.6 of its travel (latched, one key per push)
                     let b = unsafe { ev.cbutton };
+                    quit_combo(b.which, b.button);
                     if let Some(i) = d.pad_index(b.which)
                         && let Some(button) = controller_button(b.button)
                         && let Some(k) = menu_button(button, &d.list[i].face)
@@ -777,6 +778,32 @@ impl Gamepads {
         self.records_into(&mut records);
         input.set_pads(&records);
         self.records_buf = records;
+    }
+}
+
+/// ReNFS5 (handhelds): **Select + Start** quits, the PortMaster convention (`gptokeyb`'s hotkey; the
+/// engine reads the pad itself, so `gptokeyb` maps nothing). The quit goes through the window layer as
+/// `SDL_QUIT` → `CloseRequested`, the same exit as closing the window. `NFS_QUIT_COMBO=0` turns it off.
+fn quit_combo(which: sys::SDL_JoystickID, button: u8) {
+    use sys::SDL_GameControllerButton as B;
+    let (back, start) = (B::SDL_CONTROLLER_BUTTON_BACK as u8, B::SDL_CONTROLLER_BUTTON_START as u8);
+    if button != back && button != start {
+        return;
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("NFS_QUIT_COMBO").is_ok_and(|v| v.trim() == "0")) {
+        return;
+    }
+    let other = if button == back { B::SDL_CONTROLLER_BUTTON_START } else { B::SDL_CONTROLLER_BUTTON_BACK };
+    // SAFETY: the instance id of an event just taken; NULL when the device is gone
+    unsafe {
+        let pad = sys::SDL_GameControllerFromInstanceID(which);
+        if !pad.is_null() && sys::SDL_GameControllerGetButton(pad, other) != 0 {
+            tracing::info!("Select + Start: quit");
+            let mut q: sys::SDL_Event = std::mem::zeroed();
+            q.type_ = sys::SDL_EventType::SDL_QUIT as u32;
+            sys::SDL_PushEvent(&mut q);
+        }
     }
 }
 

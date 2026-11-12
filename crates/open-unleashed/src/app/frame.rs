@@ -45,12 +45,35 @@ impl App {
         if nfs_game::config::cfg().nfs_fe_idle_verify.is_set() {
             self.fe_idle_verify(idle);
         }
+        // ReNFS5: the launcher's FPS COUNTER (`NFS5_FPS_OVERLAY=1`), the last second's frame count in the corner
+        let overlay_from = self.scene.sprites.len();
+        if fps_overlay_on() && let Some(r) = self.renderer.as_mut() {
+            FPS_FONT.with(|cell| {
+                let mut font = cell.borrow_mut();
+                if font.is_none() {
+                    let dir = self.paths.fe_data().join("Art");
+                    *font = Some(
+                        GamePaths::find_file(&dir, "Univers14b.ffn")
+                            .and_then(|p| std::fs::read(p).ok())
+                            .and_then(|d| nfs_formats::fnt::Font::parse(&d).ok())
+                            .map(|f| BitmapFont::upload(r, f)),
+                    );
+                }
+                if let Some(Some(f)) = font.as_mut() {
+                    let (w, h) = r.size();
+                    f.set_aspect(w as f32 / h.max(1) as f32);
+                    let fps = LAST_FPS.load(std::sync::atomic::Ordering::Relaxed);
+                    self.scene.sprites.extend(f.sprites(&format!("{fps} FPS"), [0.012, 0.012], 0.04, [1.0, 0.85, 0.2, 1.0]));
+                }
+            });
+        }
         if !idle
             && let Some(r) = self.renderer.as_mut()
             && let Err(e) = r.render(&self.scene, &self.camera)
         {
             tracing::error!(error = %e, "render failed");
         }
+        self.scene.sprites.truncate(overlay_from);
         // PORT-DEVIATION D46: a photo-mode still asked for this frame, taken from the scene just drawn
         self.photo_after_frame();
         self.mirror_sky_update();
@@ -58,6 +81,7 @@ impl App {
         self.frames += 1;
         if self.fps_timer.elapsed() >= Duration::from_secs(1) {
             tracing::info!(fps = self.frames, tick = self.tick, "frame stats");
+            LAST_FPS.store(self.frames as u32, std::sync::atomic::Ordering::Relaxed);
             // **PLATFORM GLUE** (not in the original): `NFS_DEMO=1` shows the frame rate, the GPU / graphics API and the
             // platform in the window title, for demo recordings (and keeps the window on top, `session.rs`)
             if nfs_game::config::cfg().nfs_demo.is_set()
@@ -366,4 +390,19 @@ mod fe_step_tests {
             assert!((9_995..=10_005).contains(&total), "{fps} fps: {total} ms in 10 s");
         }
     }
+}
+
+thread_local! {
+    /// ReNFS5: the FPS counter's font (the front end's `Univers14b.ffn`), uploaded on first use;
+    /// `Some(None)` when it could not be read
+    static FPS_FONT: std::cell::RefCell<Option<Option<BitmapFont>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ReNFS5: the frames drawn in the last full second (the FPS counter's value).
+static LAST_FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// ReNFS5: `NFS5_FPS_OVERLAY=1` (the launcher's FPS COUNTER) draws the frame rate.
+fn fps_overlay_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NFS5_FPS_OVERLAY").is_ok_and(|v| v.trim() == "1"))
 }
