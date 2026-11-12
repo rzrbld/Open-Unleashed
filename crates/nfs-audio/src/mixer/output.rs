@@ -1,4 +1,5 @@
-//! The output: the offline dump, the cpal stream glue and the public `AudioOutput` API.
+//! The output: the offline dump, the device stream glue (SDL2 or cpal, `NFS_AUDIO`) and the public
+//! `AudioOutput` API.
 
 use super::*;
 
@@ -134,8 +135,187 @@ impl PlayArgs {
     }
 }
 
+/// The audio engine a device stream runs on (`NFS_AUDIO`, [`Backend::from_env`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// SDL2's audio subsystem — the firmware's own driver (ALSA, PulseAudio, PipeWire, …,
+    /// `SDL_AUDIODRIVER`), what PortMaster ports rely on
+    Sdl,
+    /// cpal, which on Linux talks to ALSA directly
+    Cpal,
+}
+
+impl Backend {
+    /// PORT-DEVIATION (not in the original): `NFS_AUDIO` = `sdl` | `cpal` | `auto` (the default,
+    /// SDL2 first). The backends tried in order: the asked one, then the other one as a fallback.
+    pub fn order_from_env() -> [Backend; 2] {
+        let v = std::env::var("NFS_AUDIO").unwrap_or_default().to_ascii_lowercase();
+        match v.trim() {
+            "cpal" | "alsa" => [Backend::Cpal, Backend::Sdl],
+            "" | "auto" | "sdl" | "sdl2" => [Backend::Sdl, Backend::Cpal],
+            other => {
+                tracing::warn!(value = other, "audio: unknown NFS_AUDIO (sdl | cpal | auto), using auto");
+                [Backend::Sdl, Backend::Cpal]
+            }
+        }
+    }
+}
+
+/// The open device stream of an [`AudioOutput`]; dropping it stops the device callback.
+pub(super) enum Stream {
+    Cpal(#[allow(dead_code)] cpal::Stream),
+    Sdl(#[allow(dead_code)] SdlStream),
+}
+
+/// What the SDL2 callback works on, behind the `userdata` pointer. `core` is put in after the
+/// device is open (its rate is the obtained one) and before it is unpaused: SDL never calls the
+/// callback of a paused device, and `SDL_PauseAudioDevice` takes the device's lock, which orders
+/// the write before the audio thread's first read.
+struct SdlCtx {
+    core: Option<Core>,
+    channels: usize,
+    rate: f64,
+    /// the device buffer in frames (`have.samples`): SDL2 gives no playback timestamp, so this is
+    /// the latency the callback reports
+    frames: u64,
+}
+
+/// An open SDL2 playback device and its callback's state ([`SdlCtx`]). The audio subsystem is
+/// initialised with `SDL_InitSubSystem` (ref-counted; the window side owns `SDL_Init`/`SDL_Quit`)
+/// and quit again on drop.
+pub(super) struct SdlStream {
+    dev: sdl2_sys::SDL_AudioDeviceID,
+    ctx: *mut SdlCtx,
+}
+
+// SAFETY: the context is only touched by SDL's audio thread while the device is open; this side
+// only closes the device (which joins that thread) and then frees it. `Core` is `Send` (cpal's
+// callback owns one on its own thread the same way).
+unsafe impl Send for SdlStream {}
+
+/// SDL's subsystem init / quit and device open / close are not thread-safe: two outputs opened
+/// at once (the tests do) crash inside SDL. Every such call of this module holds this lock; the
+/// audio callback never takes it.
+static SDL_LOCK: Mutex<()> = Mutex::new(());
+
+impl Drop for SdlStream {
+    fn drop(&mut self) {
+        let _g = SDL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            sdl2_sys::SDL_CloseAudioDevice(self.dev);
+            drop(Box::from_raw(self.ctx));
+            sdl2_sys::SDL_QuitSubSystem(sdl2_sys::SDL_INIT_AUDIO);
+        }
+    }
+}
+
+unsafe extern "C" fn sdl_callback(userdata: *mut std::ffi::c_void, stream: *mut u8, len: std::ffi::c_int) {
+    // SAFETY: `userdata` is the `SdlCtx` box, alive until the device is closed; SDL hands a buffer
+    // of `len` bytes in the format of the spec (f32, the format change is never allowed), aligned
+    // for it (SDL allocates it with SDL_malloc / SIMD alignment).
+    let ctx = unsafe { &mut *(userdata as *mut SdlCtx) };
+    let n = len.max(0) as usize / std::mem::size_of::<f32>();
+    let out = unsafe { std::slice::from_raw_parts_mut(stream as *mut f32, n) };
+    let Some(core) = ctx.core.as_mut() else {
+        out.fill(0.0);
+        return;
+    };
+    core.drain();
+    core.lat.frames.store(ctx.frames.max((n / ctx.channels.max(1)) as u64), Ordering::Relaxed);
+    core.lat.at.store(core.lat.epoch.elapsed().as_nanos() as u64 + 1, Ordering::Release);
+    core.fill(out, ctx.channels, ctx.rate);
+    core.publish();
+}
+
+fn sdl_error() -> String {
+    unsafe {
+        let e = sdl2_sys::SDL_GetError();
+        if e.is_null() { String::new() } else { std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned() }
+    }
+}
+
+/// The SDL2 device buffer asked for, in frames: `NFS_AUDIO_FRAMES` (a power of two is best;
+/// clamped to 64..=8192), else 512.
+fn sdl_buffer_frames() -> u16 {
+    std::env::var("NFS_AUDIO_FRAMES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(512).clamp(64, 8192) as u16
+}
+
+impl SdlStream {
+    /// Opens the default playback device (f32, 44100 Hz stereo asked; SDL may change the rate and
+    /// the channel count, never the format — it converts for us), with a mixer at the obtained
+    /// rate, and starts it.
+    fn open() -> anyhow::Result<(Self, Arc<Tx>, u32)> {
+        use sdl2_sys as sdl;
+        let _g = SDL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            if sdl::SDL_InitSubSystem(sdl::SDL_INIT_AUDIO) != 0 {
+                anyhow::bail!("SDL_InitSubSystem(AUDIO): {}", sdl_error());
+            }
+        }
+        let ctx = Box::into_raw(Box::new(SdlCtx { core: None, channels: 2, rate: 44100.0, frames: 0 }));
+        let fail = |msg: String| -> anyhow::Error {
+            unsafe {
+                drop(Box::from_raw(ctx));
+                sdl::SDL_QuitSubSystem(sdl::SDL_INIT_AUDIO);
+            }
+            anyhow::anyhow!(msg)
+        };
+        let want = sdl::SDL_AudioSpec {
+            freq: 44100,
+            format: sdl::AUDIO_F32SYS as sdl::SDL_AudioFormat,
+            channels: 2,
+            silence: 0,
+            samples: sdl_buffer_frames(),
+            padding: 0,
+            size: 0,
+            callback: Some(sdl_callback),
+            userdata: ctx as *mut std::ffi::c_void,
+        };
+        let open = |flags: u32| -> (sdl::SDL_AudioDeviceID, sdl::SDL_AudioSpec) {
+            let mut have: sdl::SDL_AudioSpec = unsafe { std::mem::zeroed() };
+            let dev = unsafe { sdl::SDL_OpenAudioDevice(std::ptr::null(), 0, &want, &mut have, flags as std::ffi::c_int) };
+            (dev, have)
+        };
+        let (mut dev, mut have) = open(sdl::SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | sdl::SDL_AUDIO_ALLOW_CHANNELS_CHANGE);
+        if dev != 0 && (have.format as u32 != sdl::AUDIO_F32SYS || have.channels == 0 || have.freq <= 0) {
+            // not expected without SDL_AUDIO_ALLOW_FORMAT_CHANGE; SDL converts with no change allowed
+            tracing::warn!(format = have.format, channels = have.channels, freq = have.freq, "audio (SDL2): unusable spec, reopening with no change allowed");
+            unsafe { sdl::SDL_CloseAudioDevice(dev) };
+            (dev, have) = open(0);
+        }
+        if dev == 0 {
+            return Err(fail(format!("SDL_OpenAudioDevice: {}", sdl_error())));
+        }
+        let rate = have.freq as u32;
+        let (tx, core) = Tx::new(rate, false);
+        // SAFETY: the device is paused (SDL opens it so), its callback does not run yet
+        unsafe {
+            let c = &mut *ctx;
+            c.core = Some(core.expect("a device mixer has its callback half"));
+            c.channels = have.channels as usize;
+            c.rate = rate as f64;
+            c.frames = have.samples as u64;
+            sdl::SDL_PauseAudioDevice(dev, 0);
+        }
+        let driver = unsafe {
+            let d = sdl::SDL_GetCurrentAudioDriver();
+            if d.is_null() { String::from("?") } else { std::ffi::CStr::from_ptr(d).to_string_lossy().into_owned() }
+        };
+        tracing::info!(
+            backend = "sdl2",
+            driver,
+            rate,
+            channels = have.channels,
+            buffer_frames = have.samples,
+            format = format_args!("{:#06x}", have.format),
+            "audio output started"
+        );
+        Ok((SdlStream { dev, ctx }, tx, rate))
+    }
+}
+
 pub struct AudioOutput {
-    pub(super) _stream: Option<cpal::Stream>,
+    pub(super) _stream: Option<Stream>,
     pub(super) tx: Arc<Tx>,
     pub rate: u32,
 }
@@ -158,6 +338,31 @@ impl AudioOutput {
             tracing::info!("audio: muted test run (NFS_MUTE / NFS_NO_FOCUS; NFS_SOUND=1 for the device), no device");
             return Ok(Self { _stream: None, tx, rate: 44100 });
         }
+        let order = Backend::order_from_env();
+        let mut errors = Vec::new();
+        for (k, backend) in order.into_iter().enumerate() {
+            let opened = match backend {
+                Backend::Sdl => SdlStream::open().map(|(s, tx, rate)| Self { _stream: Some(Stream::Sdl(s)), tx, rate }),
+                Backend::Cpal => Self::new_cpal(),
+            };
+            match opened {
+                Ok(out) => {
+                    if k > 0 {
+                        tracing::warn!(?backend, wanted = ?order[0], "audio: fell back to the other backend");
+                    }
+                    return Ok(out);
+                }
+                Err(e) => {
+                    tracing::warn!(?backend, error = %e, "audio: backend failed to open");
+                    errors.push(format!("{backend:?}: {e}"));
+                }
+            }
+        }
+        Err(anyhow::anyhow!("no audio output ({})", errors.join("; ")))
+    }
+
+    /// The cpal device stream: the default device at its default config.
+    fn new_cpal() -> anyhow::Result<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
         let supported = device.default_output_config()?;
@@ -179,8 +384,8 @@ impl AudioOutput {
             match Self::open(&device, &config, channels, core) {
                 Ok(stream) => {
                     stream.play()?;
-                    tracing::info!(rate, channels, buffer = ?config.buffer_size, "audio output started");
-                    return Ok(Self { _stream: Some(stream), tx, rate });
+                    tracing::info!(backend = "cpal", host = ?host.id(), rate, channels, buffer = ?config.buffer_size, "audio output started");
+                    return Ok(Self { _stream: Some(Stream::Cpal(stream)), tx, rate });
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, buffer = ?config.buffer_size, "audio stream refused");
@@ -452,7 +657,7 @@ impl AudioOutput {
     }
 
     /// A cheap, cloneable handle that can [`Self::stop`] a voice without keeping the whole
-    /// `AudioOutput` (its `cpal::Stream`) alive — `FEMovie`'s own audio track (`mad.md` §14) needs
+    /// `AudioOutput` (its device stream) alive — `FEMovie`'s own audio track (`mad.md` §14) needs
     /// to stop itself well after the code that started it has moved on: at a loop restart
     /// (0x4E2380's `0x567690`) and whenever its widget is torn down (the destructor was not traced;
     /// this is the port's own equivalent, so no voice a widget started is ever left playing once

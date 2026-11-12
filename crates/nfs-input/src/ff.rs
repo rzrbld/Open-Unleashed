@@ -1,23 +1,42 @@
 //! Force-feedback output — the port's mechanism (`RE/notes/force-feedback.md` §10–§13). Two backends,
-//! both SDL3:
+//! both SDL (SDL2 since the PortMaster port; SDL3 upstream — the names in the RE notes below are
+//! partly SDL3's):
 //!
 //! * **Rumble** ([`Rumbler`], a standard pad on every OS): two sustained motor levels (strong /
-//!   weak) and one-shot pulses of both through `SDL_RumbleGamepad` — the low- and high-frequency
+//!   weak) and one-shot pulses of both through `SDL_GameControllerRumble` — the low- and high-frequency
 //!   motors (XInput / GameInput / Windows.Gaming.Input on Windows, evdev `FF_RUMBLE` or HIDAPI on
 //!   Linux, GameController + CoreHaptics on macOS, which is what the port's own `ff_macos.rs`
 //!   did by hand until SDL3). The mapping of the original's effects onto two motors is
 //!   **PORT-DEVIATION D24** and lives with the caller (`open_unleashed::app::force_feedback`).
 //! * **Haptic** ([`HapticWheel`], a wheel or any other non-pad joystick SDL can drive through
-//!   `SDL_OpenHapticFromJoystick`): the original's four DirectInput effects one for one —
+//!   `SDL_HapticOpenFromJoystick`): the original's four DirectInput effects one for one —
 //!   constant force, square, sine, spring — with the arguments of 0x533910 / 0x5338D0
 //!   ([`DiCall`]) converted to SDL's units ([`sdl_effect`]); DirectInput on Windows, evdev `FF_*` on
 //!   Linux, IOKit `ForceFeedback.framework` on macOS. **Not tested on a device** (no wheel was
-//!   available).
+//!   available). SDL2 has no square wave (`SDL_HAPTIC_SQUARE` is commented out of its header and
+//!   its backends), so the square slot plays a **sine** of the same period (**APPROXIMATION**).
 //!
-//! Trigger rumble (`SDL_RumbleGamepadTriggers`) is not driven: none of the original's four effects
+//! Trigger rumble (`SDL_GameControllerRumbleTriggers`, SDL 2.0.14) is not driven: none of the original's four effects
 //! is a trigger effect, and no producer has anything that would map onto one.
 
-use sdl3_sys::haptic::*;
+use sdl2_sys as sys;
+use sdl2_sys::{SDL_Haptic, SDL_HapticCondition, SDL_HapticConstant, SDL_HapticDirection, SDL_HapticEffect, SDL_HapticPeriodic};
+use std::ffi::c_int;
+
+/// SDL2's effect types as the effect structs' `type_` (`SDL_haptic.h`'s `#define`s are `u32` in the
+/// bindings, the field is 16 bits).
+pub const SDL_HAPTIC_CONSTANT: u16 = sys::SDL_HAPTIC_CONSTANT as u16;
+pub const SDL_HAPTIC_SINE: u16 = sys::SDL_HAPTIC_SINE as u16;
+pub const SDL_HAPTIC_SPRING: u16 = sys::SDL_HAPTIC_SPRING as u16;
+/// The direction encoding (`SDL_HapticDirection::type_`, 8 bits).
+pub const SDL_HAPTIC_POLAR: u8 = sys::SDL_HAPTIC_POLAR as u8;
+pub const SDL_HAPTIC_INFINITY: u32 = sys::SDL_HAPTIC_INFINITY;
+
+/// An all-zero value of one of SDL's plain C haptic structs (they derive no `Default`).
+fn zeroed<T: Copy>() -> T {
+    // SAFETY: only used for SDL's haptic structs / unions, all integer fields, for which all-zero is valid
+    unsafe { std::mem::zeroed() }
+}
 
 /// A sustained rumble: one level per motor, played until it is stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +47,7 @@ pub enum Motor {
     Weak,
 }
 
-/// Where the rumbler's calls go: `SDL_RumbleGamepad` on the first device that can (the
+/// Where the rumbler's calls go: `SDL_GameControllerRumble` on the first device that can (the
 /// [`crate::gamepad::Devices`]), a recorder in the tests.
 pub(crate) trait RumbleSink {
     /// `low` / `high` = the strong / weak motors, 0…65535, for `ms`; false when SDL refused it.
@@ -45,7 +64,7 @@ impl RumbleSink for crate::gamepad::Devices {
 /// motors at once for a duration, so every change re-sends the combined state.
 ///
 /// **Rate limit (PAD-HANG, PORT-DEVIATION D24).** The producers hand a new level every Sc32 tick
-/// (the engine rumble follows the revs, the road rumble the speed), and every `SDL_RumbleGamepad`
+/// (the engine rumble follows the revs, the road rumble the speed), and every `SDL_GameControllerRumble`
 /// whose pair differs from the last reaches the driver (`SDL_joystick.c` `SDL_RumbleJoystick`:
 /// only an identical pair is "just update the expiration"). On macOS the driver is the
 /// GameController one (`SDL_mfijoystick.m` `IOS_JoystickRumble` → `SDL3_RumbleContext
@@ -240,16 +259,43 @@ pub enum DiCall {
 }
 
 /// An SDL effect description (the arm of `SDL_HapticEffect` in use, comparable).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub enum SdlEffect {
     Constant(SDL_HapticConstant),
     Periodic(SDL_HapticPeriodic),
     Condition(SDL_HapticCondition),
 }
 
+/// The fields of `SdlEffect`'s arm that this module sets, for comparing (the `sdl2-sys` structs
+/// derive no `PartialEq`, and their padding must not be compared).
+impl PartialEq for SdlEffect {
+    fn eq(&self, other: &Self) -> bool {
+        let dir = |d: &SDL_HapticDirection| (d.type_, d.dir);
+        match (self, other) {
+            (SdlEffect::Constant(a), SdlEffect::Constant(b)) => {
+                (a.type_, dir(&a.direction), a.length, a.delay, a.button, a.interval, a.level)
+                    == (b.type_, dir(&b.direction), b.length, b.delay, b.button, b.interval, b.level)
+                    && (a.attack_length, a.attack_level, a.fade_length, a.fade_level) == (b.attack_length, b.attack_level, b.fade_length, b.fade_level)
+            }
+            (SdlEffect::Periodic(a), SdlEffect::Periodic(b)) => {
+                (a.type_, dir(&a.direction), a.length, a.delay, a.button, a.interval, a.period, a.magnitude, a.offset, a.phase)
+                    == (b.type_, dir(&b.direction), b.length, b.delay, b.button, b.interval, b.period, b.magnitude, b.offset, b.phase)
+                    && (a.attack_length, a.attack_level, a.fade_length, a.fade_level) == (b.attack_length, b.attack_level, b.fade_length, b.fade_level)
+            }
+            (SdlEffect::Condition(a), SdlEffect::Condition(b)) => {
+                (a.type_, dir(&a.direction), a.length, a.delay, a.button, a.interval) == (b.type_, dir(&b.direction), b.length, b.delay, b.button, b.interval)
+                    && (a.right_sat, a.left_sat, a.right_coeff, a.left_coeff, a.deadband, a.center) == (b.right_sat, b.left_sat, b.right_coeff, b.left_coeff, b.deadband, b.center)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SdlEffect {}
+
 impl SdlEffect {
     fn raw(&self) -> SDL_HapticEffect {
-        let mut e = SDL_HapticEffect::default();
+        let mut e: SDL_HapticEffect = zeroed();
         match *self {
             SdlEffect::Constant(c) => e.constant = c,
             SdlEffect::Periodic(p) => e.periodic = p,
@@ -294,20 +340,21 @@ fn gained(v: i32, gain: i32) -> i32 {
 /// `DIDEVTYPEJOYSTICK_WHEEL`, here `SDL_JOYSTICK_TYPE_WHEEL`): the effects are created with the polar
 /// direction **90°** on a wheel and 0° otherwise (0x411E06…0x411E24); the jolt carries its own.
 pub fn sdl_effect(call: &DiCall, wheel: bool) -> Option<SdlEffect> {
-    let polar = |deg100: i32| SDL_HapticDirection { r#type: SDL_HAPTIC_POLAR, dir: [deg100, 0, 0] };
+    let polar = |deg100: i32| SDL_HapticDirection { type_: SDL_HAPTIC_POLAR, dir: [deg100, 0, 0] };
     let created = polar(if wheel { 9000 } else { 0 });
     Some(match *call {
         DiCall::Stop(_) => return None,
-        DiCall::Periodic { slot, magnitude, period_us, gain } => SdlEffect::Periodic(SDL_HapticPeriodic {
-            r#type: if slot == DiSlot::Square { SDL_HAPTIC_SQUARE } else { SDL_HAPTIC_SINE },
+        // SDL2 has no square wave: the square slot is a sine too (APPROXIMATION, see the module notes)
+        DiCall::Periodic { slot: _, magnitude, period_us, gain } => SdlEffect::Periodic(SDL_HapticPeriodic {
+            type_: SDL_HAPTIC_SINE,
             direction: created,
             length: SDL_HAPTIC_INFINITY,
             period: ms16(period_us).max(1),
             magnitude: sdl_level(gained(magnitude, gain)),
-            ..Default::default()
+            ..zeroed()
         }),
         DiCall::Spring { x, y, gain } => {
-            let mut c = SDL_HapticCondition { r#type: SDL_HAPTIC_SPRING, direction: created, length: SDL_HAPTIC_INFINITY, ..Default::default() };
+            let mut c = SDL_HapticCondition { type_: SDL_HAPTIC_SPRING, direction: created, length: SDL_HAPTIC_INFINITY, ..zeroed() };
             for (i, (offset, coef)) in [x, y].into_iter().enumerate() {
                 // DICONDITION {lOffset, lPositiveCoefficient = lNegativeCoefficient = dwPositiveSaturation =
                 // dwNegativeSaturation = coef, lDeadBand 0} (0x4125F5…0x4126F4); the gain scales the
@@ -327,7 +374,7 @@ pub fn sdl_effect(call: &DiCall, wheel: bool) -> Option<SdlEffect> {
             // negative, a huge DWORD to DirectInput — 0 here (APPROXIMATION: SDL's field is unsigned)
             let dur = duration_us.clamp(0, 1_500_000);
             SdlEffect::Constant(SDL_HapticConstant {
-                r#type: SDL_HAPTIC_CONSTANT,
+                type_: SDL_HAPTIC_CONSTANT,
                 direction: polar(direction.rem_euclid(360) * 100),
                 length: ms(dur).max(1),
                 level: sdl_level(gained(magnitude, gain)),
@@ -335,26 +382,26 @@ pub fn sdl_effect(call: &DiCall, wheel: bool) -> Option<SdlEffect> {
                 attack_level: sdl_level(gained(attack_level, gain).clamp(0, 10000)) as u16,
                 fade_length: ms16(fade_time),
                 fade_level: sdl_level(gained(fade_level, gain).clamp(0, 10000)) as u16,
-                ..Default::default()
+                ..zeroed()
             })
         }
     })
 }
 
-/// `SDL_GetHapticFeatures` bits (`SDL_haptic.h`; written out because sdl3-sys 0.7's
-/// `SDL_HapticEffectType` is 16 bits wide and truncates `SDL_HAPTIC_GAIN` = 1 << 16 to 0).
-const FEAT_CONSTANT: u32 = 1 << 0;
-const FEAT_SINE: u32 = 1 << 1;
-const FEAT_SQUARE: u32 = 1 << 2;
-const FEAT_SPRING: u32 = 1 << 7;
-const FEAT_GAIN: u32 = 1 << 16;
-/// Any of the four effects the original drives.
-pub(crate) const FEAT_ANY: u32 = FEAT_CONSTANT | FEAT_SINE | FEAT_SQUARE | FEAT_SPRING;
+/// `SDL_HapticQuery` bits (SDL2's `SDL_haptic.h`: no square — SDL3's `1 << 2` is SDL2's
+/// `LEFTRIGHT` — and `SDL_HAPTIC_GAIN` is `1 << 12`, SDL3's `1 << 16`).
+const FEAT_CONSTANT: u32 = sys::SDL_HAPTIC_CONSTANT;
+const FEAT_SINE: u32 = sys::SDL_HAPTIC_SINE;
+const FEAT_SPRING: u32 = sys::SDL_HAPTIC_SPRING;
+const FEAT_GAIN: u32 = sys::SDL_HAPTIC_GAIN;
+/// Any of the effects the original's four are played with.
+pub(crate) const FEAT_ANY: u32 = FEAT_CONSTANT | FEAT_SINE | FEAT_SPRING;
 
 fn slot_feature(slot: DiSlot) -> u32 {
     match slot {
         DiSlot::Constant => FEAT_CONSTANT,
-        DiSlot::Square => FEAT_SQUARE,
+        // played as a sine (SDL2 has no square)
+        DiSlot::Square => FEAT_SINE,
         DiSlot::Sine => FEAT_SINE,
         DiSlot::Spring => FEAT_SPRING,
     }
@@ -367,23 +414,24 @@ pub struct HapticWheel {
     pub(crate) features: u32,
     /// `SDL_JOYSTICK_TYPE_WHEEL` (0x412D5A's class)
     pub(crate) wheel: bool,
-    effects: [Option<(SDL_HapticEffectID, SdlEffect)>; 4],
+    effects: [Option<(c_int, SdlEffect)>; 4],
     running: [bool; 4],
     failed: [bool; 4],
 }
 
 impl HapticWheel {
     /// # Safety
-    /// `haptic` is a device `SDL_OpenHapticFromJoystick` returned; it is closed on drop.
+    /// `haptic` is a device `SDL_HapticOpenFromJoystick` returned; it is closed on drop.
     pub(crate) unsafe fn new(haptic: *mut SDL_Haptic, wheel: bool) -> Self {
-        let features = unsafe { SDL_GetHapticFeatures(haptic) };
+        // SDL_HapticQuery answers 0 on an error, i.e. no effects
+        let features = unsafe { sys::SDL_HapticQuery(haptic) };
         Self { haptic, features, wheel, effects: [None; 4], running: [false; 4], failed: [false; 4] }
     }
 
     /// 0x5333A0 at session start: `DIPROP_FFGAIN` = `FF.TotalVolume`·100 — SDL's device gain 0…100
     /// (its DirectInput backend sets exactly `gain·100`). Without `SDL_HAPTIC_GAIN` nothing is set.
     pub(crate) fn set_gain(&mut self, total: i32) {
-        if self.features & FEAT_GAIN != 0 && !unsafe { SDL_SetHapticGain(self.haptic, total.clamp(0, 100)) } {
+        if self.features & FEAT_GAIN != 0 && unsafe { sys::SDL_HapticSetGain(self.haptic, total.clamp(0, 100)) } != 0 {
             tracing::warn!(error = %crate::gamepad::sdl_error(), "haptic: gain not set");
         }
     }
@@ -402,24 +450,24 @@ impl HapticWheel {
         }
         let Some(eff) = sdl_effect(call, self.wheel) else {
             if let (Some((id, _)), true) = (self.effects[i], self.running[i]) {
-                unsafe { SDL_StopHapticEffect(self.haptic, id) };
+                unsafe { sys::SDL_HapticStopEffect(self.haptic, id) };
             }
             self.running[i] = false;
             return;
         };
-        let raw = eff.raw();
+        let mut raw = eff.raw();
         let id = match self.effects[i] {
             Some((id, last)) if last == eff => id,
             Some((id, _)) => {
-                if !unsafe { SDL_UpdateHapticEffect(self.haptic, id, &raw) } {
+                if unsafe { sys::SDL_HapticUpdateEffect(self.haptic, id, &mut raw) } != 0 {
                     return self.fail(i, "update");
                 }
                 self.effects[i] = Some((id, eff));
                 id
             }
             None => {
-                let id = unsafe { SDL_CreateHapticEffect(self.haptic, &raw) };
-                if id.0 < 0 {
+                let id = unsafe { sys::SDL_HapticNewEffect(self.haptic, &mut raw) };
+                if id < 0 {
                     return self.fail(i, "create");
                 }
                 self.effects[i] = Some((id, eff));
@@ -429,7 +477,7 @@ impl HapticWheel {
         // `Start` unless running (0x533B40); a jolt is finite, and its re-arm window (1.11 × the
         // duration, 0x412CF0) has let the last one end, so it is started every time
         if !self.running[i] || slot == DiSlot::Constant {
-            if !unsafe { SDL_RunHapticEffect(self.haptic, id, 1) } {
+            if unsafe { sys::SDL_HapticRunEffect(self.haptic, id, 1) } != 0 {
                 return self.fail(i, "run");
             }
             self.running[i] = slot != DiSlot::Constant;
@@ -443,14 +491,14 @@ impl HapticWheel {
 
     /// Stop every effect (the pause / race-exit paths, 0x412030…).
     pub(crate) fn stop_all(&mut self) {
-        unsafe { SDL_StopHapticEffects(self.haptic) };
+        unsafe { sys::SDL_HapticStopAll(self.haptic) };
         self.running = [false; 4];
     }
 }
 
 impl Drop for HapticWheel {
     fn drop(&mut self) {
-        unsafe { SDL_CloseHaptic(self.haptic) };
+        unsafe { sys::SDL_HapticClose(self.haptic) };
     }
 }
 
@@ -588,7 +636,7 @@ mod tests {
         let jolt_with = |fade_time| DiCall::Constant { magnitude: 8000, duration_us: 300_000, direction: 270, attack_level: 8000, attack_time: 150_000, fade_level: 8000, fade_time, gain: 50 };
         let jolt = jolt_with(292_000);
         let Some(SdlEffect::Constant(c)) = sdl_effect(&jolt, true) else { panic!() };
-        assert_eq!((c.direction.r#type, c.direction.dir[0]), (SDL_HAPTIC_POLAR, 27000));
+        assert_eq!((c.direction.type_, c.direction.dir[0]), (SDL_HAPTIC_POLAR, 27000));
         assert_eq!((c.length, c.attack_length, c.fade_length), (300, 150, 292));
         assert_eq!(c.level, sdl_level(4000));
         // the landing jolt's negative fade time
@@ -597,7 +645,8 @@ mod tests {
         assert_eq!(c.fade_length, 0);
         let road = DiCall::Periodic { slot: DiSlot::Square, magnitude: 5000, period_us: 166_667, gain: 100 };
         let Some(SdlEffect::Periodic(p)) = sdl_effect(&road, true) else { panic!() };
-        assert_eq!((p.r#type, p.period, p.magnitude, p.length), (SDL_HAPTIC_SQUARE, 167, sdl_level(5000), SDL_HAPTIC_INFINITY));
+        // SDL2 has no square: a sine of the same period
+        assert_eq!((p.type_, p.period, p.magnitude, p.length), (SDL_HAPTIC_SINE, 167, sdl_level(5000), SDL_HAPTIC_INFINITY));
         assert_eq!(p.direction.dir[0], 9000, "a wheel's effects are created at 90°");
         let spring = DiCall::Spring { x: (300, 6000), y: (0, 0), gain: 100 };
         let Some(SdlEffect::Condition(s)) = sdl_effect(&spring, true) else { panic!() };

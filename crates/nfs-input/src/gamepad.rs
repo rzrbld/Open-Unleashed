@@ -1,6 +1,15 @@
-//! Joystick input via SDL3 (`sdl3-sys`, SDL built from source and linked statically; joystick /
-//! gamepad / haptic subsystems only — no window, events polled from the game thread). Mapped onto the
-//! same logical actions as the keyboard. `RE/notes/controls.md` §SDL3 has the move from SDL2.
+//! Joystick input via SDL2 (`sdl2-sys`, the firmware's dynamically linked SDL2 — the window and GL
+//! come from the same library through `winit-sdl2`; joystick / game-controller / haptic subsystems
+//! only, events taken from the process-wide queue on the game thread). Mapped onto the same logical
+//! actions as the keyboard. `RE/notes/controls.md` §SDL3 has the move from SDL2; the PortMaster
+//! port (aarch64 handhelds) moved back to SDL2 so that one SDL (the firmware's, with PortMaster's
+//! `SDL_GAMECONTROLLERCONFIG`) serves the window and the pads.
+//!
+//! **SDL2 versions.** The firmware's SDL2 can be as old as 2.0.16, so nothing here needs a newer
+//! one at load time: `SDL_JoystickHasRumble` (2.0.18) is looked up at run time
+//! ([`has_rumble_fn`]), and the rest is 2.0.12 or older (`SDL_GameControllerGetType` 2.0.12,
+//! `SDL_JoystickRumble` / `SDL_GameControllerRumble` 2.0.9, `SDL_JoystickGetDeviceInstanceID`
+//! 2.0.6).
 //!
 //! The dead zone comes from the front end's own `XAxis.Min`, as the original's does. The binding
 //! builder around 0x51CC70 switches on the axis index through the jump table at 0x51D028, looks
@@ -39,13 +48,46 @@
 
 use crate::InputState;
 use crate::bindings::PadRecord;
-use sdl3_sys::events::*;
-use sdl3_sys::gamepad::*;
-use sdl3_sys::haptic::{SDL_IsJoystickHaptic, SDL_OpenHapticFromJoystick};
-use sdl3_sys::hints::*;
-use sdl3_sys::init::*;
-use sdl3_sys::joystick::*;
-use std::ffi::CStr;
+use sdl2_sys::SDL_GameControllerButton::*;
+use sdl2_sys::{SDL_GameController, SDL_GameControllerAxis, SDL_GameControllerButton, SDL_Joystick, SDL_JoystickID};
+use std::ffi::{CStr, c_int, c_void};
+
+/// The SDL2 calls this module makes, from `sdl2-sys`, except the two that answer an enum: SDL's
+/// own enums grow between releases, and an out-of-range value in a Rust enum is undefined
+/// behaviour, so those two are declared here answering the raw `int`.
+mod sys {
+    pub use sdl2_sys::*;
+    use std::ffi::c_int;
+    #[allow(clashing_extern_declarations)]
+    unsafe extern "C" {
+        /// `SDL_JoystickType` as an `int` (SDL 2.0.6)
+        #[link_name = "SDL_JoystickGetType"]
+        pub fn joystick_type(joystick: *mut SDL_Joystick) -> c_int;
+        /// `SDL_GameControllerType` as an `int` (SDL 2.0.12)
+        #[link_name = "SDL_GameControllerGetType"]
+        pub fn controller_type(gamecontroller: *mut SDL_GameController) -> c_int;
+    }
+}
+
+/// `SDL_JOYSTICK_TYPE_*` (SDL2's `SDL_JoystickType`, raw).
+const JOYSTICK_TYPE_UNKNOWN: c_int = 0;
+const JOYSTICK_TYPE_GAMECONTROLLER: c_int = 1;
+const JOYSTICK_TYPE_WHEEL: c_int = 2;
+
+/// SDL2's Nintendo `SDL_GameControllerType`s, raw: `NINTENDO_SWITCH_PRO` (2.0.12) and the
+/// Joy-Con left / right / pair (2.24; an older SDL never answers them).
+const NINTENDO_TYPES: [c_int; 4] = [5, 11, 12, 13];
+
+/// The SDL2 event types this module takes off the shared queue (`SDL_EventType`, raw: the queue is
+/// the whole process's, see [`Gamepads::poll`]).
+const EV_JOYDEVICEADDED: u32 = sys::SDL_EventType::SDL_JOYDEVICEADDED as u32;
+const EV_JOYDEVICEREMOVED: u32 = sys::SDL_EventType::SDL_JOYDEVICEREMOVED as u32;
+const EV_CONTROLLERAXISMOTION: u32 = sys::SDL_EventType::SDL_CONTROLLERAXISMOTION as u32;
+const EV_CONTROLLERBUTTONDOWN: u32 = sys::SDL_EventType::SDL_CONTROLLERBUTTONDOWN as u32;
+/// The joystick / game-controller block of event types (`SDL_JOYAXISMOTION` 0x600 …), the one the
+/// window layer (`winit-sdl2`'s `sdl.rs`) leaves queued for this module.
+const EV_PAD_FIRST: u32 = 0x600;
+const EV_PAD_LAST: u32 = 0x6FF;
 
 /// The port's own names for a standard pad's buttons (the layout `gilrs` used to call
 /// `South` … `RightThumb`; SDL's gamepad buttons map onto them in `Device::open` / [`face_buttons`]).
@@ -93,22 +135,28 @@ pub struct Gamepads {
 /// The last SDL error, for the log.
 pub(crate) fn sdl_error() -> String {
     // SAFETY: SDL_GetError returns a valid, NUL-terminated string (possibly empty)
-    unsafe { CStr::from_ptr(sdl3_sys::error::SDL_GetError()) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(sys::SDL_GetError()) }.to_string_lossy().into_owned()
 }
 
 /// One opened SDL joystick. The handles are SDL's own and are closed on drop.
 struct Device {
-    /// the joystick instance id (SDL3: stable for the device's connection)
+    /// the joystick instance id (stable for the device's connection; SDL2's added event carries a
+    /// device *index* instead, which [`Devices::open`] turns into this)
     id: SDL_JoystickID,
     joy: *mut SDL_Joystick,
-    /// the gamepad view of the same device, opened only for a **standard pad** (see
-    /// [`Devices::open`]); null for wheels, sticks, pedals and anything SDL has no gamepad
+    /// the game-controller view of the same device, opened only for a **standard pad** (see
+    /// [`Devices::open`]); null for wheels, sticks, pedals and anything SDL has no controller
     /// mapping for, which are read raw
-    pad: *mut SDL_Gamepad,
-    /// SDL's gamepad buttons for the port's `South`, `East`, `North`, `West` ([`face_buttons`])
-    face: [SDL_GamepadButton; 4],
+    pad: *mut SDL_GameController,
+    /// SDL's controller buttons for the port's `South`, `East`, `North`, `West` ([`face_buttons`])
+    face: [SDL_GameControllerButton; 4],
     /// the force-feedback device of a non-pad joystick SDL can drive ([`crate::ff::HapticWheel`])
     haptic: Option<crate::ff::HapticWheel>,
+    /// whether the device can rumble: `SDL_JoystickHasRumble` where the SDL2 has it (2.0.18);
+    /// on an older one assumed, and cleared when SDL refuses a rumble (answers −1)
+    rumble: bool,
+    /// `rumble` is SDL's own answer (not a guess to clear on a refusal)
+    rumble_known: bool,
     name: String,
 }
 
@@ -118,114 +166,167 @@ impl Drop for Device {
         // SAFETY: both handles were opened by `Devices::open` and are closed once, here
         unsafe {
             if !self.pad.is_null() {
-                SDL_CloseGamepad(self.pad);
+                sys::SDL_GameControllerClose(self.pad);
             }
-            SDL_CloseJoystick(self.joy);
+            sys::SDL_JoystickClose(self.joy);
         }
     }
 }
 
-/// The SDL context with only the joystick / gamepad (and, if it starts, haptic) subsystems — no video,
-/// so no window and no focus change — and the devices it has opened, in connection order. Everything
-/// runs on the thread that created it (the game's main thread).
+/// The SDL joystick / game-controller (and, if it starts, haptic) subsystems — the video side (the
+/// window layer) owns SDL itself — and the devices opened, in connection order. Everything runs on
+/// the thread that created it (the game's main thread).
 pub struct Devices {
     list: Vec<Device>,
     haptic: bool,
 }
 
-const SUBSYSTEMS: SDL_InitFlags = SDL_InitFlags(SDL_INIT_JOYSTICK.0 | SDL_INIT_GAMEPAD.0);
+const SUBSYSTEMS: u32 = sys::SDL_INIT_JOYSTICK | sys::SDL_INIT_GAMECONTROLLER;
+
+type HasRumbleFn = unsafe extern "C" fn(*mut SDL_Joystick) -> sys::SDL_bool;
+
+/// `SDL_JoystickHasRumble` (SDL **2.0.18**), looked up in the running SDL2 rather than linked, so an
+/// older firmware SDL (2.0.16) still loads the game; `None` there.
+fn has_rumble_fn() -> Option<HasRumbleFn> {
+    static F: std::sync::OnceLock<Option<HasRumbleFn>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        // SAFETY: SDL_LoadObject(NULL) is `dlopen(NULL)`, the program's global symbol scope (the
+        // linked SDL2 among it); never unloaded. The symbol, when present, has this signature.
+        unsafe {
+            let h = sys::SDL_LoadObject(std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let f = sys::SDL_LoadFunction(h, c"SDL_JoystickHasRumble".as_ptr());
+            (!f.is_null()).then(|| std::mem::transmute::<*mut c_void, HasRumbleFn>(f))
+        }
+    })
+}
 
 impl Devices {
     fn new() -> Result<Self, String> {
         // SAFETY: plain SDL calls with valid NUL-terminated strings, on the thread that owns SDL
         unsafe {
             // a game in the background still reads its pad; no signal handlers of SDL's own
-            SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, c"1".as_ptr());
-            SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, c"1".as_ptr());
+            sys::SDL_SetHint(sys::SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS.as_ptr().cast(), c"1".as_ptr());
+            sys::SDL_SetHint(sys::SDL_HINT_NO_SIGNAL_HANDLERS.as_ptr().cast(), c"1".as_ptr());
             // macOS: SDL's own HID drivers (HIDAPI) take the Xbox / PlayStation / Switch pads they
             // know, the GameController framework (SDL's MFi driver) the rest, the IOKit joystick
             // driver wheels and pedals. PAD-FF (2026-10-27): with HIDAPI off every pad went through
             // the MFi driver, whose rumble is CoreHaptics (four `CHHapticEngine`s, two
             // `sendParameters` a call) — late and smeared on an Xbox pad, where HIDAPI
             // writes the pad's own rumble report at once.
-            if !SDL_Init(SUBSYSTEMS) {
+            //
+            // SDL2: only the subsystems — the window layer owns `SDL_Init` / `SDL_Quit`.
+            if sys::SDL_InitSubSystem(SUBSYSTEMS) != 0 {
                 return Err(sdl_error());
             }
-            let haptic = SDL_InitSubSystem(SDL_INIT_HAPTIC);
+            let haptic = sys::SDL_InitSubSystem(sys::SDL_INIT_HAPTIC) == 0;
             if !haptic {
                 tracing::warn!(error = %sdl_error(), "SDL haptic subsystem unavailable (no wheel force feedback)");
             }
-            let mut d = Self { list: Vec::new(), haptic };
-            let mut n = 0;
-            let ids = SDL_GetJoysticks(&mut n);
-            if !ids.is_null() {
-                for i in 0..n.max(0) as usize {
-                    d.open(*ids.add(i));
+            // SDL2 reads `SDL_GAMECONTROLLERCONFIG` itself; PortMaster also hands a mapping file
+            if let Some(path) = std::env::var_os("SDL_GAMECONTROLLERCONFIG_FILE").filter(|p| !p.is_empty()) {
+                match std::ffi::CString::new(path.to_string_lossy().into_owned()) {
+                    Ok(c) => {
+                        let rw = sys::SDL_RWFromFile(c.as_ptr(), c"rb".as_ptr());
+                        let n = if rw.is_null() { -1 } else { sys::SDL_GameControllerAddMappingsFromRW(rw, 1) };
+                        if n < 0 {
+                            tracing::warn!(file = %path.to_string_lossy(), error = %sdl_error(), "SDL_GAMECONTROLLERCONFIG_FILE not loaded");
+                        } else {
+                            tracing::info!(file = %path.to_string_lossy(), mappings = n, "SDL_GAMECONTROLLERCONFIG_FILE loaded");
+                        }
+                    }
+                    Err(_) => tracing::warn!("SDL_GAMECONTROLLERCONFIG_FILE has a NUL byte; ignored"),
                 }
-                sdl3_sys::stdinc::SDL_free(ids.cast());
             }
-            let v = sdl3_sys::version::SDL_GetVersion();
-            tracing::info!(sdl = format!("{}.{}.{}", v / 1_000_000, v / 1000 % 1000, v % 1000).as_str(), joysticks = d.list.len(), haptic, "SDL joystick layer started");
+            let mut d = Self { list: Vec::new(), haptic };
+            for i in 0..sys::SDL_NumJoysticks().max(0) {
+                d.open(i);
+            }
+            let mut v = sys::SDL_version { major: 0, minor: 0, patch: 0 };
+            sys::SDL_GetVersion(&mut v);
+            tracing::info!(
+                sdl = format!("{}.{}.{}", v.major, v.minor, v.patch).as_str(),
+                joysticks = d.list.len(),
+                haptic,
+                has_rumble_query = has_rumble_fn().is_some(),
+                "SDL joystick layer started"
+            );
             Ok(d)
         }
     }
 
-    /// Open the joystick with SDL instance id `id`. A device is read through the gamepad mapping
-    /// only when SDL classes it as a **gamepad** (`SDL_JOYSTICK_TYPE_GAMEPAD`, SDL2's
-    /// `GAMECONTROLLER`) and has a mapping (`SDL_IsGamepad`); a wheel, flight stick, throttle or
-    /// pedal set — even one the controller database knows — is read raw, so every axis and slider
-    /// stays visible (`RE/notes/controls.md`, PA-SDL). A non-pad device SDL can drive force feedback
-    /// on gets its haptic device opened too.
-    fn open(&mut self, id: SDL_JoystickID) {
-        if self.list.iter().any(|d| d.id == id) {
-            return;
-        }
-        // SAFETY: `id` comes from SDL (the device list or an added event); every handle is checked
+    /// Open the joystick at SDL2 device index `index` (unless its instance is open already). A
+    /// device is read through the controller mapping only when SDL classes it as a **game
+    /// controller** (`SDL_JOYSTICK_TYPE_GAMECONTROLLER`, or `UNKNOWN` — which SDL3 also counts as a
+    /// gamepad when it has a mapping) and has a mapping (`SDL_IsGameController`); a wheel, flight
+    /// stick, throttle or pedal set — even one the controller database knows — is read raw, so
+    /// every axis and slider stays visible (`RE/notes/controls.md`, PA-SDL). A non-pad device SDL
+    /// can drive force feedback on gets its haptic device opened too. Returns the instance id.
+    fn open(&mut self, index: c_int) -> Option<SDL_JoystickID> {
+        // SAFETY: `index` comes from SDL (the device count or an added event); every handle is checked
         unsafe {
-            let joy = SDL_OpenJoystick(id);
+            let id = sys::SDL_JoystickGetDeviceInstanceID(index);
+            if id >= 0 && self.list.iter().any(|d| d.id == id) {
+                return Some(id);
+            }
+            let joy = sys::SDL_JoystickOpen(index);
             if joy.is_null() {
                 tracing::warn!(error = %sdl_error(), "joystick not opened");
-                return;
+                return None;
             }
-            let ty = SDL_GetJoystickType(joy);
-            let standard = ty == SDL_JOYSTICK_TYPE_GAMEPAD && SDL_IsGamepad(id);
-            let pad = if standard { SDL_OpenGamepad(id) } else { std::ptr::null_mut() };
+            let id = sys::SDL_JoystickInstanceID(joy);
+            if self.list.iter().any(|d| d.id == id) {
+                // opened twice: SDL counts the opens, so this one is closed again
+                sys::SDL_JoystickClose(joy);
+                return Some(id);
+            }
+            let ty = sys::joystick_type(joy);
+            let standard = (ty == JOYSTICK_TYPE_GAMECONTROLLER || ty == JOYSTICK_TYPE_UNKNOWN)
+                && sys::SDL_IsGameController(index) == sys::SDL_bool::SDL_TRUE;
+            let pad = if standard { sys::SDL_GameControllerOpen(index) } else { std::ptr::null_mut() };
             let face = if pad.is_null() {
                 DEFAULT_FACE
             } else {
-                face_buttons([SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH].map(|b| SDL_GetGamepadButtonLabel(pad, b)))
+                let labels = sys::SDL_GetHintBoolean(sys::SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS.as_ptr().cast(), sys::SDL_bool::SDL_TRUE) == sys::SDL_bool::SDL_TRUE;
+                face_buttons(sys::controller_type(pad), labels)
             };
             let name = {
-                let p = SDL_GetJoystickName(joy);
+                let p = sys::SDL_JoystickName(joy);
                 if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
             };
-            let haptic = if pad.is_null() && self.haptic && SDL_IsJoystickHaptic(joy) {
-                let h = SDL_OpenHapticFromJoystick(joy);
+            let haptic = if pad.is_null() && self.haptic && sys::SDL_JoystickIsHaptic(joy) == 1 {
+                let h = sys::SDL_HapticOpenFromJoystick(joy);
                 if h.is_null() {
                     tracing::warn!(name = name.as_str(), error = %sdl_error(), "haptic device not opened");
                     None
                 } else {
-                    let w = crate::ff::HapticWheel::new(h, ty == SDL_JOYSTICK_TYPE_WHEEL);
+                    let w = crate::ff::HapticWheel::new(h, ty == JOYSTICK_TYPE_WHEEL);
                     (w.features & crate::ff::FEAT_ANY != 0).then_some(w)
                 }
             } else {
                 None
             };
-            let count = |n: i32| n.max(0);
-            let path = SDL_GetJoystickPath(joy);
-            let path = if path.is_null() { String::new() } else { std::ffi::CStr::from_ptr(path).to_string_lossy().into_owned() };
+            let (rumble, rumble_known) = match has_rumble_fn() {
+                Some(f) => (f(joy) == sys::SDL_bool::SDL_TRUE, true),
+                // SDL2 < 2.0.18: try it; the first refusal says no
+                None => (true, false),
+            };
+            let count = |n: c_int| n.max(0);
             tracing::info!(
                 name = name.as_str(),
-                path = path.as_str(),
-                axes = count(SDL_GetNumJoystickAxes(joy)),
-                hats = count(SDL_GetNumJoystickHats(joy)),
-                buttons = count(SDL_GetNumJoystickButtons(joy)),
+                axes = count(sys::SDL_JoystickNumAxes(joy)),
+                hats = count(sys::SDL_JoystickNumHats(joy)),
+                buttons = count(sys::SDL_JoystickNumButtons(joy)),
                 mapped_pad = !pad.is_null(),
                 haptic = haptic.as_ref().map_or(0, |h| h.features),
-                wheel = ty == SDL_JOYSTICK_TYPE_WHEEL,
+                rumble = if rumble_known { if rumble { "yes" } else { "no" } } else { "unknown" },
+                wheel = ty == JOYSTICK_TYPE_WHEEL,
                 "joystick connected"
             );
-            self.list.push(Device { id, joy, pad, face, haptic, name });
+            self.list.push(Device { id, joy, pad, face, haptic, rumble, rumble_known, name });
+            Some(id)
         }
     }
 
@@ -239,15 +340,20 @@ impl Devices {
         self.list.iter().find(|d| d.can_rumble()).map(|d| d.name.as_str())
     }
 
-    /// `SDL_RumbleGamepad` (`SDL_RumbleJoystick` on a raw device) on the first device that can:
-    /// `low` / `high` are the strong / weak motors, 0…65535, for `ms`.
+    /// `SDL_GameControllerRumble` (`SDL_JoystickRumble` on a raw device) on the first device that
+    /// can: `low` / `high` are the strong / weak motors, 0…65535, for `ms`. On an SDL2 without
+    /// `SDL_JoystickHasRumble` a refusal marks the device as one that cannot, so the next call
+    /// goes to the next device.
     pub(crate) fn rumble(&mut self, low: u16, high: u16, ms: u32) -> bool {
-        match self.list.iter().find(|d| d.can_rumble()) {
-            // SAFETY: the handles are open for as long as the device is in the list
-            Some(d) if !d.pad.is_null() => unsafe { SDL_RumbleGamepad(d.pad, low, high, ms) },
-            Some(d) => unsafe { SDL_RumbleJoystick(d.joy, low, high, ms) },
-            None => false,
+        let Some(d) = self.list.iter_mut().find(|d| d.can_rumble()) else { return false };
+        // SAFETY: the handles are open for as long as the device is in the list
+        let r = unsafe { if !d.pad.is_null() { sys::SDL_GameControllerRumble(d.pad, low, high, ms) } else { sys::SDL_JoystickRumble(d.joy, low, high, ms) } };
+        if r != 0 && !d.rumble_known {
+            tracing::info!(name = d.name.as_str(), error = %sdl_error(), "rumble refused; the device cannot rumble");
+            d.rumble = false;
+            d.rumble_known = true;
         }
+        r == 0
     }
 
     /// The first device with an SDL haptic device (a wheel, …).
@@ -259,49 +365,78 @@ impl Devices {
 impl Drop for Devices {
     fn drop(&mut self) {
         self.list.clear();
-        // SAFETY: balances the `SDL_Init` / `SDL_InitSubSystem` of `Devices::new`
+        // SAFETY: balances the `SDL_InitSubSystem`s of `Devices::new`
         unsafe {
             if self.haptic {
-                SDL_QuitSubSystem(SDL_INIT_HAPTIC);
+                sys::SDL_QuitSubSystem(sys::SDL_INIT_HAPTIC);
             }
-            SDL_QuitSubSystem(SUBSYSTEMS);
+            sys::SDL_QuitSubSystem(SUBSYSTEMS);
         }
     }
 }
 
 impl Device {
-    /// `SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN` (SDL2's `SDL_JoystickHasRumble`).
+    /// SDL2's `SDL_JoystickHasRumble` (SDL3's `SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN`), queried
+    /// once when the device was opened — or, on an SDL2 older than 2.0.18, assumed until a
+    /// rumble is refused ([`Devices::rumble`]).
     fn can_rumble(&self) -> bool {
-        // SAFETY: the joystick is open; the property name is SDL's own constant
-        unsafe { sdl3_sys::properties::SDL_GetBooleanProperty(SDL_GetJoystickProperties(self.joy), SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN, false) }
+        self.rumble
     }
 }
 
-/// SDL3's buttons for the port's `South`, `East`, `North`, `West` on a pad that reports no labels
-/// (or one whose labels match the positions — Xbox, PlayStation): the positions.
-const DEFAULT_FACE: [SDL_GamepadButton; 4] = [SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_WEST];
+/// SDL2's buttons for the port's `South`, `East`, `North`, `West`: `A B Y X`, the names the port's
+/// numbering came from.
+const DEFAULT_FACE: [SDL_GameControllerButton; 4] = [SDL_CONTROLLER_BUTTON_A, SDL_CONTROLLER_BUTTON_B, SDL_CONTROLLER_BUTTON_Y, SDL_CONTROLLER_BUTTON_X];
 
-/// The SDL3 face buttons that are the port's `South`, `East`, `North`, `West` (`BUTTON_ORDER` 0…3),
-/// from the labels SDL reports for the south, east, west and north positions.
+/// The SDL2 controller buttons that are the port's `South`, `East`, `North`, `West`
+/// (`BUTTON_ORDER` 0…3), from the controller's `SDL_GameControllerType` (raw) and whether SDL names
+/// a Nintendo layout's buttons by their labels (`SDL_GAMECONTROLLER_USE_BUTTON_LABELS`).
 ///
-/// The port's numbering came from SDL2's game-controller names `A B Y X`, and SDL2 (2.26, the
-/// bundled one until SDL3) named a Nintendo layout's buttons **by their labels**
-/// (`SDL_GAMECONTROLLER_USE_BUTTON_LABELS`, on by default: `A` was the right-hand button labelled
-/// A). SDL3's buttons are positional (`SOUTH` is the bottom one whatever it reads), so each of `A B
-/// Y X` is looked up by its label to keep a Switch-style pad's bindings and the front end's A / B
-/// where they were; PlayStation's ✕ ○ △ □ are `A B Y X`; a pad without labels keeps the positions.
-pub fn face_buttons(labels: [SDL_GamepadButtonLabel; 4]) -> [SDL_GamepadButton; 4] {
-    use SDL_GamepadButtonLabel as L;
-    let positions = [SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH];
-    let wanted = [[L::A, L::CROSS], [L::B, L::CIRCLE], [L::Y, L::TRIANGLE], [L::X, L::SQUARE]];
-    let mut out = DEFAULT_FACE;
-    for (slot, w) in wanted.iter().enumerate() {
-        if let Some(n) = labels.iter().position(|l| w.contains(l)) {
-            out[slot] = positions[n];
-        }
+/// The port's numbering came from SDL2's game-controller names `A B Y X`, and SDL2 names a
+/// Nintendo layout's buttons **by their labels** while `SDL_GAMECONTROLLER_USE_BUTTON_LABELS` is on
+/// (the default: `A` is the right-hand button labelled A), so then the names are the port's buttons
+/// on every pad, as before the SDL3 move. With the hint off SDL2's names are positional (`A` is the
+/// bottom button whatever it reads, as SDL3's `SOUTH`), and on a Nintendo pad each of `A B Y X` is
+/// looked up by its label — labelled A is the right-hand button, SDL2's positional `B`; labelled B
+/// the bottom one, `A`; labelled Y the left one, `X`; labelled X the top one, `Y` — which
+/// keeps a Switch-style pad's bindings and the front end's A / B where they were (what the SDL3
+/// code did from `SDL_GetGamepadButtonLabel`; SDL2 has no labels before 2.30). PlayStation's
+/// ✕ ○ △ □ are `A B Y X` either way.
+pub fn face_buttons(controller_type: c_int, use_button_labels: bool) -> [SDL_GameControllerButton; 4] {
+    if !use_button_labels && NINTENDO_TYPES.contains(&controller_type) {
+        [SDL_CONTROLLER_BUTTON_B, SDL_CONTROLLER_BUTTON_A, SDL_CONTROLLER_BUTTON_X, SDL_CONTROLLER_BUTTON_Y]
+    } else {
+        DEFAULT_FACE
     }
-    // a partial or odd label set that would bind one SDL button twice keeps the positions
-    if (0..4).any(|i| (i + 1..4).any(|j| out[i] == out[j])) { DEFAULT_FACE } else { out }
+}
+
+/// A controller button number from an SDL2 event as the enum, `None` past the ones this SDL2's
+/// header knows (a newer SDL can send more; a Rust enum must never hold an unknown value).
+fn controller_button(raw: u8) -> Option<SDL_GameControllerButton> {
+    const ALL: [SDL_GameControllerButton; 21] = [
+        SDL_CONTROLLER_BUTTON_A,
+        SDL_CONTROLLER_BUTTON_B,
+        SDL_CONTROLLER_BUTTON_X,
+        SDL_CONTROLLER_BUTTON_Y,
+        SDL_CONTROLLER_BUTTON_BACK,
+        SDL_CONTROLLER_BUTTON_GUIDE,
+        SDL_CONTROLLER_BUTTON_START,
+        SDL_CONTROLLER_BUTTON_LEFTSTICK,
+        SDL_CONTROLLER_BUTTON_RIGHTSTICK,
+        SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
+        SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+        SDL_CONTROLLER_BUTTON_DPAD_UP,
+        SDL_CONTROLLER_BUTTON_DPAD_DOWN,
+        SDL_CONTROLLER_BUTTON_DPAD_LEFT,
+        SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+        SDL_CONTROLLER_BUTTON_MISC1,
+        SDL_CONTROLLER_BUTTON_PADDLE1,
+        SDL_CONTROLLER_BUTTON_PADDLE2,
+        SDL_CONTROLLER_BUTTON_PADDLE3,
+        SDL_CONTROLLER_BUTTON_PADDLE4,
+        SDL_CONTROLLER_BUTTON_TOUCHPAD,
+    ];
+    ALL.iter().copied().find(|b| *b as i32 == i32::from(raw))
 }
 /// `Analog`'s reader **0x411B80**: raw axis `v` (0…65535) against the descriptor's `lo`/`hi`
 /// bytes, 0…255. Integer arithmetic as the original's (`idiv`, truncating).
@@ -433,7 +568,7 @@ impl Gamepads {
         std::mem::take(&mut self.pad_hotplug)
     }
 
-    /// Whether a pad that can rumble is connected (`SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN`).
+    /// Whether a pad that can rumble is connected (`SDL_JoystickHasRumble`, see [`Device::can_rumble`]).
     pub fn rumble_supported(&self) -> bool {
         self.devices.as_ref().is_some_and(|d| self.rumbler.supported(d))
     }
@@ -547,9 +682,18 @@ impl Gamepads {
         }
     }
 
-    /// Drain SDL's events, open / drop hot-plugged devices, queue the front end's pad keys
-    /// ([`crate::MenuNav`]) and hand every device's record to the bindings (`InputState::set_pads`).
-    /// Call once per frame (on the game thread: the pump belongs to the thread that initialised SDL).
+    /// Drain SDL's joystick / controller events, open / drop hot-plugged devices, queue the front
+    /// end's pad keys ([`crate::MenuNav`]) and hand every device's record to the bindings
+    /// (`InputState::set_pads`). Call once per frame (on the game thread: the pump belongs to the
+    /// thread that initialised SDL).
+    ///
+    /// SDL2 has **one event queue for the whole process**, shared with the window layer
+    /// (`winit-sdl2`), which pumps it every frame and takes every event type but the joystick /
+    /// controller block 0x600…0x6FF. So this takes only that block (`SDL_PeepEvents` …
+    /// `SDL_GETEVENT`), never `SDL_PollEvent`, which would steal the window's and the keyboard's
+    /// events. Without a window (the video subsystem not started: headless `--autotest` runs)
+    /// nobody pumps, so this pumps itself first; the window events that queues (none without video)
+    /// would stay for the window layer.
     ///
     /// PORT-DEVIATION D44 (PAD-MODERN): in a race a pad works **only through its bindings**, as the
     /// original's packer 0x412E70 reads a pad (`Analog` 0x411B80, `Button` 0x411A50, `Pov`
@@ -558,53 +702,73 @@ impl Gamepads {
     /// navigation keys stay the port's own (PORT-DEVIATION D10).
     pub fn poll(&mut self, input: &mut InputState) {
         let Some(d) = self.devices.as_mut() else { return };
-        let mut ev = SDL_Event::default();
-        // SAFETY: SDL_PollEvent fills `ev`; each arm reads the union member its type names
-        while unsafe { SDL_PollEvent(&mut ev) } {
-            let ty = SDL_EventType(unsafe { ev.r#type });
-            if ty == SDL_EVENT_JOYSTICK_ADDED {
-                let which = unsafe { ev.jdevice.which };
-                d.open(which);
-                self.pad_hotplug = true;
-                // a force-feedback device arriving (a Bluetooth pad's MFi discovery finishes after
-                // the race has armed, or the player connects one mid-race): the caller re-arms
-                if d.list.iter().any(|x| x.id == which && (x.haptic.is_some() || x.can_rumble())) {
-                    self.ff_hotplug = true;
+        // SAFETY: plain SDL calls on the thread that owns SDL
+        unsafe {
+            if sys::SDL_WasInit(sys::SDL_INIT_VIDEO) == 0 {
+                sys::SDL_PumpEvents();
+            }
+        }
+        // SAFETY: an all-zero SDL_Event is a valid value of the (plain C) union
+        let mut evs: [sys::SDL_Event; 16] = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: SDL_PeepEvents fills at most `evs.len()` events of the 0x600…0x6FF block
+            let n = unsafe { sys::SDL_PeepEvents(evs.as_mut_ptr(), evs.len() as c_int, sys::SDL_eventaction::SDL_GETEVENT, EV_PAD_FIRST, EV_PAD_LAST) };
+            if n <= 0 {
+                break;
+            }
+            for ev in &evs[..n as usize] {
+                // SAFETY: each arm reads the union member its type names
+                let ty = unsafe { ev.type_ };
+                if ty == EV_JOYDEVICEADDED {
+                    // SDL2: the added event's `which` is a device **index**
+                    let index = unsafe { ev.jdevice.which };
+                    if let Some(id) = d.open(index) {
+                        self.pad_hotplug = true;
+                        // a force-feedback device arriving (a Bluetooth pad's MFi discovery finishes after
+                        // the race has armed, or the player connects one mid-race): the caller re-arms
+                        if d.list.iter().any(|x| x.id == id && (x.haptic.is_some() || x.can_rumble())) {
+                            self.ff_hotplug = true;
+                        }
+                    }
+                } else if ty == EV_JOYDEVICEREMOVED {
+                    // … and the removed event's an **instance id**
+                    let which = unsafe { ev.jdevice.which };
+                    if let Some(i) = d.list.iter().position(|x| x.id == which) {
+                        tracing::info!(name = d.list[i].name.as_str(), "joystick disconnected");
+                        d.list.remove(i);
+                    }
+                } else if ty == EV_CONTROLLERBUTTONDOWN {
+                    // the front end's pad keys (D10): a standard pad's d-pad, A and B, and the left
+                    // stick past 0.6 of its travel (latched, one key per push)
+                    let b = unsafe { ev.cbutton };
+                    if let Some(i) = d.pad_index(b.which)
+                        && let Some(button) = controller_button(b.button)
+                        && let Some(k) = menu_button(button, &d.list[i].face)
+                    {
+                        input.pad_menu.push(k);
+                    }
+                } else if ty == EV_CONTROLLERAXISMOTION {
+                    let a = unsafe { ev.caxis };
+                    if d.pad_index(a.which).is_none() {
+                        continue;
+                    }
+                    let axis = i32::from(a.axis);
+                    let (i, neg, pos) = if axis == SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_LEFTX as i32 {
+                        (0, crate::MenuNav::Left, crate::MenuNav::Right)
+                    } else if axis == SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_LEFTY as i32 {
+                        (1, crate::MenuNav::Up, crate::MenuNav::Down)
+                    } else {
+                        continue;
+                    };
+                    let v = unit(a.value);
+                    let now = v.abs() > MENU_STICK;
+                    if now && !self.stick_latch[i] {
+                        input.pad_menu.push(if v < 0.0 { neg } else { pos });
+                    }
+                    self.stick_latch[i] = now;
                 }
-            } else if ty == SDL_EVENT_JOYSTICK_REMOVED {
-                let which = unsafe { ev.jdevice.which };
-                if let Some(i) = d.list.iter().position(|x| x.id == which) {
-                    tracing::info!(name = d.list[i].name.as_str(), "joystick disconnected");
-                    d.list.remove(i);
-                }
-            } else if ty == SDL_EVENT_GAMEPAD_BUTTON_DOWN {
-                // the front end's pad keys (D10): a standard pad's d-pad, A and B, and the left
-                // stick past 0.6 of its travel (latched, one key per push)
-                let b = unsafe { ev.gbutton };
-                if let Some(i) = d.pad_index(b.which)
-                    && let Some(k) = menu_button(SDL_GamepadButton(i32::from(b.button)), &d.list[i].face)
-                {
-                    input.pad_menu.push(k);
-                }
-            } else if ty == SDL_EVENT_GAMEPAD_AXIS_MOTION {
-                let a = unsafe { ev.gaxis };
-                if d.pad_index(a.which).is_none() {
-                    continue;
-                }
-                let axis = SDL_GamepadAxis(i32::from(a.axis));
-                let (i, neg, pos) = if axis == SDL_GAMEPAD_AXIS_LEFTX {
-                    (0, crate::MenuNav::Left, crate::MenuNav::Right)
-                } else if axis == SDL_GAMEPAD_AXIS_LEFTY {
-                    (1, crate::MenuNav::Up, crate::MenuNav::Down)
-                } else {
-                    continue;
-                };
-                let v = unit(a.value);
-                let now = v.abs() > MENU_STICK;
-                if now && !self.stick_latch[i] {
-                    input.pad_menu.push(if v < 0.0 { neg } else { pos });
-                }
-                self.stick_latch[i] = now;
+                // every other event of the block (raw joystick motion, controller added / remapped,
+                // touchpad, sensor, battery) is dropped, as the SDL3 loop dropped them
             }
         }
         // a sustained rumble change held back by the rate limit goes out once its interval is over
@@ -685,15 +849,15 @@ const MENU_STICK: f32 = 0.6;
 /// A standard pad's button as a front-end key (PORT-DEVIATION D10; the original's front end reads
 /// no pad, `RE/notes/controls.md` §4.169.5): the d-pad moves, A (the port's `South`) selects, B
 /// (`East`) goes back. `face` is the pad's [`face_buttons`].
-pub fn menu_button(b: SDL_GamepadButton, face: &[SDL_GamepadButton; 4]) -> Option<crate::MenuNav> {
+pub fn menu_button(b: SDL_GameControllerButton, face: &[SDL_GameControllerButton; 4]) -> Option<crate::MenuNav> {
     use crate::MenuNav::*;
-    Some(if b == SDL_GAMEPAD_BUTTON_DPAD_UP {
+    Some(if b == SDL_CONTROLLER_BUTTON_DPAD_UP {
         Up
-    } else if b == SDL_GAMEPAD_BUTTON_DPAD_DOWN {
+    } else if b == SDL_CONTROLLER_BUTTON_DPAD_DOWN {
         Down
-    } else if b == SDL_GAMEPAD_BUTTON_DPAD_LEFT {
+    } else if b == SDL_CONTROLLER_BUTTON_DPAD_LEFT {
         Left
-    } else if b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT {
+    } else if b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT {
         Right
     } else if b == face[0] {
         Select
@@ -751,7 +915,7 @@ pub struct PadAxisSet {
     pub values: [i32; 8],
 }
 
-/// What a **standard pad** (an SDL gamepad with a mapping) reports, in SDL's units.
+/// What a **standard pad** (an SDL game controller with a mapping) reports, in SDL's units.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PadSnapshot {
     /// left stick X / Y, right stick X / Y (SDL: Y grows downward, as DirectInput's)
@@ -765,8 +929,8 @@ pub struct PadSnapshot {
     pub buttons: [bool; 15],
 }
 
-/// A raw SDL joystick's state: `SDL_GetJoystickAxis` per axis, `SDL_GetJoystickHat` per hat (SDL's
-/// bits `up 1 | right 2 | down 4 | left 8`), `SDL_GetJoystickButton` per button.
+/// A raw SDL joystick's state: `SDL_JoystickGetAxis` per axis, `SDL_JoystickGetHat` per hat (SDL's
+/// bits `up 1 | right 2 | down 4 | left 8`), `SDL_JoystickGetButton` per button.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawSnapshot {
     pub axes: Vec<i16>,
@@ -856,14 +1020,15 @@ impl Device {
             return None;
         }
         let c = self.pad;
-        // SAFETY: the gamepad is open for as long as the device is in the list
-        let axis = |a: SDL_GamepadAxis| unsafe { SDL_GetGamepadAxis(c, a) };
-        let button = |b: SDL_GamepadButton| unsafe { SDL_GetGamepadButton(c, b) };
+        use SDL_GameControllerAxis::*;
+        // SAFETY: the controller is open for as long as the device is in the list
+        let axis = |a: SDL_GameControllerAxis| unsafe { sys::SDL_GameControllerGetAxis(c, a) };
+        let button = |b: SDL_GameControllerButton| unsafe { sys::SDL_GameControllerGetButton(c, b) != 0 };
         let mut p = PadSnapshot {
-            sticks: [SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY].map(axis),
-            // SDL3: 0…32767, as SDL2's
-            triggers: [SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER].map(axis),
-            dpad: [SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_DOWN, SDL_GAMEPAD_BUTTON_DPAD_LEFT].map(button),
+            sticks: [SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY, SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY].map(axis),
+            // SDL2: 0…32767 (SDL3's too)
+            triggers: [SDL_CONTROLLER_AXIS_TRIGGERLEFT, SDL_CONTROLLER_AXIS_TRIGGERRIGHT].map(axis),
+            dpad: [SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT].map(button),
             buttons: [false; 15],
         };
         for (n, b) in BUTTON_ORDER.iter().enumerate() {
@@ -882,33 +1047,33 @@ impl Device {
         // SAFETY: the joystick is open for as long as the device is in the list
         let snap = unsafe {
             RawSnapshot {
-                axes: (0..SDL_GetNumJoystickAxes(j).max(0)).map(|i| SDL_GetJoystickAxis(j, i)).collect(),
-                // SDL's hat bits are SDL2's: up 1 | right 2 | down 4 | left 8
-                hats: (0..SDL_GetNumJoystickHats(j).max(0)).map(|i| SDL_GetJoystickHat(j, i)).collect(),
-                buttons: (0..SDL_GetNumJoystickButtons(j).max(0)).map(|i| SDL_GetJoystickButton(j, i)).collect(),
+                axes: (0..sys::SDL_JoystickNumAxes(j).max(0)).map(|i| sys::SDL_JoystickGetAxis(j, i)).collect(),
+                // SDL2's hat bits: up 1 | right 2 | down 4 | left 8
+                hats: (0..sys::SDL_JoystickNumHats(j).max(0)).map(|i| sys::SDL_JoystickGetHat(j, i)).collect(),
+                buttons: (0..sys::SDL_JoystickNumButtons(j).max(0)).map(|i| sys::SDL_JoystickGetButton(j, i) != 0).collect(),
             }
         };
         raw_record(&snap)
     }
 }
 
-/// The SDL3 gamepad button that is the port's button `b` on a pad whose face buttons are `face`
+/// The SDL2 controller button that is the port's button `b` on a pad whose face buttons are `face`
 /// ([`face_buttons`]); `None` for the slots a standard pad has not (`C`, `Z`, the trigger slots).
 /// The rest are SDL2's game-controller names, one for one: LB / RB `LEFT_SHOULDER` /
 /// `RIGHT_SHOULDER`, `BACK`, `START`, `GUIDE`, `LEFT_STICK`, `RIGHT_STICK`.
-pub fn sdl_button(b: Button, face: &[SDL_GamepadButton; 4]) -> Option<SDL_GamepadButton> {
+pub fn sdl_button(b: Button, face: &[SDL_GameControllerButton; 4]) -> Option<SDL_GameControllerButton> {
     Some(match b {
         Button::South => face[0],
         Button::East => face[1],
         Button::North => face[2],
         Button::West => face[3],
-        Button::LeftTrigger => SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,
-        Button::RightTrigger => SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
-        Button::Select => SDL_GAMEPAD_BUTTON_BACK,
-        Button::Start => SDL_GAMEPAD_BUTTON_START,
-        Button::Mode => SDL_GAMEPAD_BUTTON_GUIDE,
-        Button::LeftThumb => SDL_GAMEPAD_BUTTON_LEFT_STICK,
-        Button::RightThumb => SDL_GAMEPAD_BUTTON_RIGHT_STICK,
+        Button::LeftTrigger => SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
+        Button::RightTrigger => SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+        Button::Select => SDL_CONTROLLER_BUTTON_BACK,
+        Button::Start => SDL_CONTROLLER_BUTTON_START,
+        Button::Mode => SDL_CONTROLLER_BUTTON_GUIDE,
+        Button::LeftThumb => SDL_CONTROLLER_BUTTON_LEFTSTICK,
+        Button::RightThumb => SDL_CONTROLLER_BUTTON_RIGHTSTICK,
         Button::C | Button::Z | Button::LeftTrigger2 | Button::RightTrigger2 => return None,
     })
 }
@@ -1124,63 +1289,84 @@ mod tests {
         assert!(((st.brake() * 126.0) as u8).min(0x7E) * 2 > 0x80);
     }
 
+    /// `sdl2-sys`'s enums derive no `Debug`: compared as their numbers
+    fn raw4(b: [SDL_GameControllerButton; 4]) -> [i32; 4] {
+        b.map(|x| x as i32)
+    }
+
     /// PAD-MODERN: the front end's pad keys (D10) are the d-pad, A and B (Y and X are the race's dialog keys, PAD-END2).
     #[test]
     fn the_front_end_pad_keys() {
         use crate::MenuNav;
         let f = DEFAULT_FACE;
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_DPAD_UP, &f), Some(MenuNav::Up));
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_DPAD_LEFT, &f), Some(MenuNav::Left));
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_SOUTH, &f), Some(MenuNav::Select));
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_EAST, &f), Some(MenuNav::Back));
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_DPAD_UP, &f), Some(MenuNav::Up));
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_DPAD_LEFT, &f), Some(MenuNav::Left));
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_A, &f), Some(MenuNav::Select));
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_B, &f), Some(MenuNav::Back));
         // PAD-END2: Y and X are the in-race dialogs' second answer and the replay bar's save
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_NORTH, &f), Some(MenuNav::Alt));
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_WEST, &f), Some(MenuNav::Aux));
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, &f), None);
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_START, &f), None);
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_Y, &f), Some(MenuNav::Alt));
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_X, &f), Some(MenuNav::Aux));
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, &f), None);
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_START, &f), None);
     }
 
-    /// SDL3: the port's `A B Y X` (South, East, North, West) are found by the labels SDL reports, as
-    /// SDL2's label-named buttons were: an Xbox or PlayStation pad keeps the positions, a Nintendo
-    /// layout (B at the bottom, A on the right) has the port's `South` on SDL3's `EAST`.
+    /// SDL2: the port's `A B Y X` (South, East, North, West) are SDL2's label-named buttons: any pad
+    /// while `SDL_GAMECONTROLLER_USE_BUTTON_LABELS` is on (the default) and any non-Nintendo pad
+    /// keeps SDL2's names; with the hint off a Nintendo layout (B at the bottom, A on the right) has
+    /// the port's `South` on SDL2's positional `B` (SDL3's `EAST`).
     #[test]
     fn the_face_buttons_follow_sdl2s_names() {
-        use SDL_GamepadButtonLabel as L;
-        // labels of the south, east, west, north positions
-        assert_eq!(face_buttons([L::A, L::B, L::X, L::Y]), DEFAULT_FACE);
-        assert_eq!(face_buttons([L::CROSS, L::CIRCLE, L::SQUARE, L::TRIANGLE]), DEFAULT_FACE);
-        assert_eq!(face_buttons([L::UNKNOWN; 4]), DEFAULT_FACE);
-        let nintendo = face_buttons([L::B, L::A, L::Y, L::X]);
-        assert_eq!(nintendo, [SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH]);
-        assert_eq!(menu_button(SDL_GAMEPAD_BUTTON_EAST, &nintendo), Some(crate::MenuNav::Select));
-        // a label set that would read one button twice keeps the positions
-        assert_eq!(face_buttons([L::A, L::A, L::X, L::Y]), DEFAULT_FACE);
+        const XBOX360: c_int = 1;
+        const PS4: c_int = 4;
+        const SWITCH_PRO: c_int = 5;
+        const JOYCON_PAIR: c_int = 13;
+        assert_eq!(raw4(face_buttons(XBOX360, true)), raw4(DEFAULT_FACE));
+        assert_eq!(raw4(face_buttons(XBOX360, false)), raw4(DEFAULT_FACE));
+        assert_eq!(raw4(face_buttons(PS4, false)), raw4(DEFAULT_FACE));
+        assert_eq!(raw4(face_buttons(0, false)), raw4(DEFAULT_FACE));
+        assert_eq!(raw4(face_buttons(SWITCH_PRO, true)), raw4(DEFAULT_FACE));
+        // a type a newer SDL adds is no Nintendo pad
+        assert_eq!(raw4(face_buttons(99, false)), raw4(DEFAULT_FACE));
+        let nintendo = face_buttons(SWITCH_PRO, false);
+        assert_eq!(raw4(nintendo), raw4([SDL_CONTROLLER_BUTTON_B, SDL_CONTROLLER_BUTTON_A, SDL_CONTROLLER_BUTTON_X, SDL_CONTROLLER_BUTTON_Y]));
+        assert_eq!(raw4(face_buttons(JOYCON_PAIR, false)), raw4(nintendo));
+        assert_eq!(menu_button(SDL_CONTROLLER_BUTTON_B, &nintendo), Some(crate::MenuNav::Select));
     }
 
-    /// The port's 15 buttons on SDL3's gamepad buttons (SDL2's `A B Y X LB RB Back Start Guide LS RS`),
+    /// An event's button number is never made an enum past the ones the header knows.
+    #[test]
+    fn event_button_numbers_are_checked() {
+        assert_eq!(controller_button(0).map(|b| b as i32), Some(SDL_CONTROLLER_BUTTON_A as i32));
+        assert_eq!(controller_button(14).map(|b| b as i32), Some(SDL_CONTROLLER_BUTTON_DPAD_RIGHT as i32));
+        assert_eq!(controller_button(20).map(|b| b as i32), Some(SDL_CONTROLLER_BUTTON_TOUCHPAD as i32));
+        assert!(controller_button(21).is_none());
+        assert!(controller_button(255).is_none());
+    }
+
+    /// The port's 15 buttons on SDL2's controller buttons (`A B Y X LB RB Back Start Guide LS RS`),
     /// the four placeholder slots on none.
     #[test]
-    fn the_port_buttons_on_sdl3() {
+    fn the_port_buttons_on_sdl2() {
         let f = DEFAULT_FACE;
-        let got: Vec<_> = BUTTON_ORDER.iter().map(|b| sdl_button(*b, &f)).collect();
+        let got: Vec<_> = BUTTON_ORDER.iter().map(|b| sdl_button(*b, &f).map(|x| x as i32)).collect();
         assert_eq!(
             got,
             [
-                Some(SDL_GAMEPAD_BUTTON_SOUTH),
-                Some(SDL_GAMEPAD_BUTTON_EAST),
-                Some(SDL_GAMEPAD_BUTTON_NORTH),
-                Some(SDL_GAMEPAD_BUTTON_WEST),
+                Some(SDL_CONTROLLER_BUTTON_A as i32),
+                Some(SDL_CONTROLLER_BUTTON_B as i32),
+                Some(SDL_CONTROLLER_BUTTON_Y as i32),
+                Some(SDL_CONTROLLER_BUTTON_X as i32),
                 None,
                 None,
-                Some(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER),
-                Some(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER),
+                Some(SDL_CONTROLLER_BUTTON_LEFTSHOULDER as i32),
+                Some(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER as i32),
                 None,
                 None,
-                Some(SDL_GAMEPAD_BUTTON_BACK),
-                Some(SDL_GAMEPAD_BUTTON_START),
-                Some(SDL_GAMEPAD_BUTTON_GUIDE),
-                Some(SDL_GAMEPAD_BUTTON_LEFT_STICK),
-                Some(SDL_GAMEPAD_BUTTON_RIGHT_STICK),
+                Some(SDL_CONTROLLER_BUTTON_BACK as i32),
+                Some(SDL_CONTROLLER_BUTTON_START as i32),
+                Some(SDL_CONTROLLER_BUTTON_GUIDE as i32),
+                Some(SDL_CONTROLLER_BUTTON_LEFTSTICK as i32),
+                Some(SDL_CONTROLLER_BUTTON_RIGHTSTICK as i32),
             ]
         );
         let p = PadSnapshot { buttons: std::array::from_fn(|n| n == 7), ..Default::default() };

@@ -23,6 +23,7 @@ pub(crate) fn point_filter() -> bool {
 mod camera;
 mod front;
 mod gpu;
+mod sdl_target;
 mod prof;
 
 pub use camera::Camera;

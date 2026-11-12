@@ -59,3 +59,8 @@ debug = 1
 # so the floating-point results are unchanged
 lto = "fat"
 codegen-units = 1
+
+# ReNFS5: wgpu-hal with one hook — a Vulkan surface made by SDL2 (`SDL_Vulkan_CreateSurface`, the
+# handhelds' KMSDRM display) is taken as the window's surface (`vulkan::set_external_surface`)
+[patch.crates-io]
+wgpu-hal = { path = "patches/wgpu-hal" }

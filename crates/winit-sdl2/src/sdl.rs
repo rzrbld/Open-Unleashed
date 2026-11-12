@@ -301,6 +301,12 @@ impl Window {
         unsafe { sys::SDL_ShowCursor(visible as i32) };
     }
 
+    pub fn is_minimized(&self) -> Option<bool> {
+        // SAFETY: a live window
+        let f = unsafe { sys::SDL_GetWindowFlags(self.raw()) };
+        Some(f & (sys::SDL_WindowFlags::SDL_WINDOW_MINIMIZED as u32 | sys::SDL_WindowFlags::SDL_WINDOW_HIDDEN as u32) != 0 && self.shared.visible)
+    }
+
     pub fn has_focus(&self) -> bool {
         true
     }
@@ -515,7 +521,7 @@ pub(crate) fn run<A: ApplicationHandler>(el: &ActiveEventLoop, app: &mut A) {
         };
         let main = windows.first().map(|s| Window { shared: s.clone() });
         let wid = main.as_ref().map_or(WindowId(0), |w| w.id());
-        let mut emit = |app: &mut A, e: WindowEvent| app.window_event(el, wid, e);
+        let emit = |app: &mut A, e: WindowEvent| app.window_event(el, wid, e);
         for ev in &events {
             // SAFETY: each arm reads the union member its type names
             let ty = unsafe { ev.type_ };

@@ -187,7 +187,9 @@ struct GpuMaterial {
 }
 
 pub(crate) struct Core {
-    surface: wgpu::Surface<'static>,
+    /// ReNFS5: the window's image through SDL2 (`sdl_target.rs`)
+    surface: crate::sdl_target::Target,
+    _instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -412,6 +414,7 @@ fn gpu_error(e: wgpu::Error) {
 
 /// PLATFORM GLUE (Windows): `dxcompiler.dll` + `dxil.dll` next to the exe (the Windows archive ships both; DXC needs dxil.dll to sign
 /// its shaders): the path to hand `Dx12Compiler::DynamicDxc`, or `None` (FXC) when either is missing or off Windows.
+#[allow(dead_code)] // ReNFS5: the Windows build's; the SDL2 target has no Direct3D
 fn win_dxc_path() -> Option<String> {
     if !cfg!(windows) {
         return None;
@@ -421,90 +424,22 @@ fn win_dxc_path() -> Option<String> {
     (dxc.is_file() && dxil.is_file()).then(|| dxc.to_string_lossy().into_owned())
 }
 
-/// PLATFORM GLUE: the instance for `backends`; `dxc` = the DXC library path for the Direct3D 12 backend, `None` = FXC.
-/// `WGPU_DX12_COMPILER` still wins over it.
-fn new_instance(window: &Arc<Window>, backends: wgpu::Backends, dxc: Option<&str>) -> wgpu::Instance {
-    let mut dx12 = wgpu::Dx12BackendOptions::default();
-    dx12.shader_compiler = match dxc {
-        Some(p) => wgpu::Dx12Compiler::DynamicDxc { dxc_path: p.to_owned() },
-        None => wgpu::Dx12Compiler::Fxc,
-    };
-    wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends,
-        backend_options: wgpu::BackendOptions { dx12, ..Default::default() }.with_env(),
-        // EGL needs the display before any surface exists
-        ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
-    })
-}
-
 /// PLATFORM GLUE (Windows): an Intel (vendor 0x8086) integrated GPU on a non-Direct3D backend is moved to its Direct3D 12 adapter.
+#[allow(dead_code)]
 pub(crate) fn prefer_dx12_over(vendor: u32, device_type: wgpu::DeviceType, backend: wgpu::Backend) -> bool {
     vendor == 0x8086 && device_type == wgpu::DeviceType::IntegratedGpu && backend != wgpu::Backend::Dx12
 }
 
 impl Core {
     pub fn new(window: Arc<Window>) -> Result<Self> {
-        let size = window.inner_size();
         // PLATFORM GLUE: the graphics API. Vulkan / Metal / Direct3D 12 first; OpenGL (EGL / WGL) only when none of
         // them gives an adapter for this window (a machine without a Vulkan driver). `WGPU_BACKEND` (wgpu's own
         // variable, e.g. `gl` or `vulkan`) picks the API instead, for testing the fallback.
         // PLATFORM GLUE (Windows): the Direct3D 12 backend compiles with DXC from beside the exe, else FXC; an Intel integrated
         // GPU takes its Direct3D 12 adapter instead of Vulkan (see `win_dxc_path`, `prefer_dx12_over`).
-        let backend_forced = wgpu::Backends::from_env().is_some();
-        let open = |backends: wgpu::Backends, dxc: Option<&str>| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
-            let mut instance = new_instance(&window, backends, dxc);
-            let mut dxc = dxc;
-            if dxc.is_some() && !backend_forced && backends.contains(wgpu::Backends::DX12) && pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12)).is_empty() {
-                // DXC was asked for but the Direct3D 12 backend did not come up (the instance drops a backend whose shader compiler failed to load): FXC
-                tracing::warn!("DXC: dxcompiler.dll / dxil.dll next to the exe did not load (no Direct3D 12 adapter with it) - falling back to FXC");
-                dxc = None;
-                instance = new_instance(&window, backends, None);
-            }
-            if let Some(p) = dxc {
-                tracing::info!(path = %p, "Direct3D 12 shader compiler: DXC (dxcompiler.dll + dxil.dll next to the exe; FXC if it fails to load)");
-            } else if cfg!(windows) {
-                tracing::info!("Direct3D 12 shader compiler: FXC (no dxcompiler.dll + dxil.dll next to the exe, or DXC did not load)");
-            }
-            // with no driver of these APIs installed at all, already the surface fails
-            let surface = instance.create_surface(window.clone()).context("create surface")?;
-            let mut adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            }))
-            .context("no suitable GPU adapter")?;
-            // the UHD 600's Vulkan driver died inside `request_device`: an Intel integrated GPU on Windows uses its Direct3D 12 adapter
-            // (the same device); discrete GPUs keep wgpu's choice, and so does everything when `WGPU_BACKEND` is set
-            if cfg!(windows) && !backend_forced {
-                let first = adapter.get_info();
-                if prefer_dx12_over(first.vendor, first.device_type, first.backend) {
-                    let alt = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12)).into_iter().find(|a| {
-                        let i = a.get_info();
-                        i.vendor == first.vendor && i.device == first.device && a.is_surface_supported(&surface)
-                    });
-                    match alt {
-                        Some(a) => {
-                            tracing::info!(name = %first.name, from = ?first.backend, "Intel integrated GPU on Windows: using its Direct3D 12 adapter instead (WGPU_BACKEND overrides)");
-                            adapter = a;
-                        }
-                        None => tracing::warn!(name = %first.name, backend = ?first.backend, "Intel integrated GPU on Windows: no Direct3D 12 adapter for it, keeping the chosen one"),
-                    }
-                }
-            }
-            Ok((instance, surface, adapter))
-        };
-        let dxc_path = win_dxc_path();
-        let (instance, surface, adapter) = match wgpu::Backends::from_env() {
-            Some(chosen) => open(chosen, dxc_path.as_deref())?,
-            None => match open(wgpu::Backends::METAL | wgpu::Backends::PRIMARY, dxc_path.as_deref()) {
-                Ok(found) => found,
-                Err(e) => {
-                    tracing::warn!(error = format!("{e:#}"), "no Vulkan / Metal / Direct3D 12 for the window: trying OpenGL");
-                    open(wgpu::Backends::GL, dxc_path.as_deref())?
-                }
-            },
-        };
+        // ReNFS5 PLATFORM GLUE: the window is SDL2's; GLES (default) or Vulkan (`NFS_GFX`), see `sdl_target.rs`
+        let crate::sdl_target::Opened { instance, target: surface, adapter } = crate::sdl_target::open(&window)?;
+        let size = window.inner_size();
         // diagnostics (port-own, `open-unleashed.log`): every adapter the instance sees, the chosen one with
         // its features / limits, so a failure on another machine can be read from the log
         for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
@@ -523,7 +458,8 @@ impl Core {
             label: Some("nfs-renderer"),
             // no optional feature for the game itself; the profiler adds the timestamp queries only when asked (never in `minimal`)
             required_features: if crate::prof::wanted() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
-            required_limits: wgpu::Limits::default(),
+            // ReNFS5: what the adapter has — a handheld GPU (Mali-G31 GLES 3.2, panvk) is below wgpu's desktop defaults
+            required_limits: adapter.limits(),
             ..Default::default()
         }))
         .context("request device")?;
@@ -536,23 +472,17 @@ impl Core {
         }
         crate::prof::init(&device, &queue);
 
-        let caps = surface.get_capabilities(&adapter);
-        // a byte surface, as Direct3D 7's was: colours, blends and interpolation work on the stored
-        // bytes, not in linear light (`RE/RENDERING.md`, "Colour space")
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
-            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
-            .unwrap_or(caps.formats[0]);
+        let mut surface = surface;
+        let (format, alpha_mode) = surface.format(&adapter);
+        let present_mode = surface.present_mode(&adapter);
+        tracing::info!(?format, ?present_mode, gl = surface.is_gl(), "window image");
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
+            present_mode,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
             // the byte pipeline's surface (`RENDERING.md` "Colour space"): no colour-space conversion
@@ -753,14 +683,17 @@ impl Core {
             }
         }
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
-        let pipelines: Vec<wgpu::RenderPipeline> = std::thread::scope(|sc| {
+        // ReNFS5: on GLES the context is current on this thread only — no worker threads
+        let pipelines: Vec<wgpu::RenderPipeline> = if surface.is_gl() {
+            specs.iter().map(|&(blend, pair, cull, depth, zwrite, layers)| make_pipeline(blend, pair, cull, depth, zwrite, layers)).collect()
+        } else { std::thread::scope(|sc| {
             let make_pipeline = &make_pipeline;
             let handles: Vec<_> = specs
                 .chunks(specs.len().div_ceil(workers))
                 .map(|c| sc.spawn(move || c.iter().map(|&(blend, pair, cull, depth, zwrite, layers)| make_pipeline(blend, pair, cull, depth, zwrite, layers)).collect::<Vec<_>>()))
                 .collect();
             handles.into_iter().flat_map(|h| h.join().expect("pipeline worker")).collect()
-        });
+        }) };
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -946,6 +879,7 @@ impl Core {
         let sprite_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sprites"), size: MAX_SPRITES * 6 * std::mem::size_of::<SpriteVertex>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut r = Self {
             surface,
+            _instance: instance,
             device,
             queue,
             config,
@@ -1149,6 +1083,11 @@ impl Core {
     }
 
     /// The finished read-backs, taken.
+    /// ReNFS5: the GL context current on this thread (`true`) or let go (`false`); nothing on Vulkan.
+    pub(crate) fn gl_current(&self, current: bool) {
+        self.surface.make_current(current);
+    }
+
     pub(crate) fn take_lens(&mut self) -> Vec<LensRead> {
         std::mem::take(&mut self.lens_done)
     }
@@ -1332,6 +1271,8 @@ impl Core {
     /// are thread-safe, so the textures are built on worker threads and pushed in order.
     pub fn upload_textures(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(items.len());
+        // ReNFS5: on GLES the context is current on this thread only — no worker threads
+        let workers = if self.surface.is_gl() { 1 } else { workers };
         let built: Vec<GpuTexture> = if workers <= 1 {
             items.iter().map(|&(w, h, m)| Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, w, h, m)).collect()
         } else {
@@ -1655,27 +1596,20 @@ impl Core {
     }
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
+        let frame = match self.surface.acquire(&self.device, &self.config)? {
+            crate::sdl_target::Acquired::Frame(f) => f,
+            crate::sdl_target::Acquired::Skip => {
                 self.flush_writes();
                 return Ok(());
             }
-            // a timeout or an occluded window: skip the frame (wgpu 30)
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.flush_writes();
-                return Ok(());
-            }
-            other => anyhow::bail!("surface texture: {other:?}"),
         };
-        let view = frame.texture.create_view(&Default::default());
+        let view = frame.texture().create_view(&Default::default());
         let aspect = self.aspect();
         let depth = self.depth_view.clone();
-        let (w, h) = (frame.texture.width(), frame.texture.height());
+        let (w, h) = (frame.texture().width(), frame.texture().height());
         let can_copy = self.lens_enabled;
-        self.encode_with_gamma(scene, camera, FrameTarget { view: &view, texture: &frame.texture, can_copy, depth_view: &depth }, w, h, aspect);
-        self.queue.present(frame);
+        self.encode_with_gamma(scene, camera, FrameTarget { view: &view, texture: frame.texture(), can_copy, depth_view: &depth }, w, h, aspect);
+        self.surface.present(&self.device, &self.queue, frame);
         self.collect_lens();
         Ok(())
     }

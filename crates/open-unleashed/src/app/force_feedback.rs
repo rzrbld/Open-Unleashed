@@ -11,12 +11,12 @@
 //! The port's choices are **PORT-DEVIATION D24** (each labelled where it is made):
 //! * **A1, the device.** The original arms force feedback only when the player has a
 //!   force-feedback-capable DirectInput device bound in the control config (0x4116D0, 0x411D20) and
-//!   picks the *last* such device of 32. The port arms it on the **first** connected device SDL3 can
+//!   picks the *last* such device of 32. The port arms it on the **first** connected device SDL can
 //!   drive effects on (a wheel or another non-pad joystick with an SDL haptic device,
 //!   `Gamepads::haptic_device`), whatever the bindings, else on a connected pad that supports rumble
-//!   (`SDL_RumbleGamepad` on every OS). The haptic device is a wheel to 0x412D5A's class test
+//!   (`SDL_GameControllerRumble` on every OS). The haptic device is a wheel to 0x412D5A's class test
 //!   (`devtype & 0xFF00 == 0x600` — `dwDevType` of the legacy `DIDEVICEINSTANCE` (0x56FDB0, filled by `GetDeviceInfo`, returned by 0x532E10 kind 2): subtype 6 = `DIDEVTYPEJOYSTICK_WHEEL`) when SDL types it
-//!   `SDL_JOYSTICK_TYPE_WHEEL`; a pad never is (an Xbox pad is GAMEPAD, subtype 4 — `force-feedback.md` §2).
+//!   `SDL_JOYSTICK_TYPE_WHEEL`; a pad never is (an Xbox pad is GAMECONTROLLER, subtype 4 — `force-feedback.md` §2).
 //! * **A2, the effect types — a pad only.** A haptic device gets the four effects one for one
 //!   ([`di_call`], `nfs_input::ff::sdl_effect`; units and millisecond rounding there). On a pad the backend has constant strong / weak motor magnitudes only (50 ms ticks).
 //!   Road (a square wave of 6…17 Hz, magnitude ≤ 5000 of 10000) → the strong motor at a constant

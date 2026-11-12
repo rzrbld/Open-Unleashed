@@ -12,3 +12,7 @@ tracing.workspace = true
 anyhow.workspace = true
 winit.workspace = true
 pollster.workspace = true
+# ReNFS5: the SDL2 target (`sdl_target.rs`) reaches into wgpu's GLES / Vulkan backends
+glow = "0.17"
+ash = "0.38"
+raw-window-handle = "0.6"

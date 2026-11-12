@@ -7,9 +7,11 @@ license.workspace = true
 [dependencies]
 nfs-formats.workspace = true
 cpal.workspace = true
+sdl2-sys.workspace = true
 tracing.workspace = true
 libm.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
 nfs-assets.workspace = true
+tracing-subscriber.workspace = true

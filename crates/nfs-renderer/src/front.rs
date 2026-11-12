@@ -157,10 +157,13 @@ impl Renderer {
             .name("nfs-render".into())
             .spawn(move || {
                 while let Ok(Job { mut core, mut list, scene, camera }) = jobs.recv() {
+                    // ReNFS5: a GL context is current on one thread at a time — this one while it draws
+                    core.gl_current(true);
                     core.frame_begin();
                     core.apply(&mut list);
                     let result = core.render(&scene, &camera);
                     let lens = core.take_lens();
+                    core.gl_current(false);
                     if done_tx.send(Done { core, list, scene, result, lens }).is_err() {
                         break;
                     }
@@ -179,6 +182,7 @@ impl Renderer {
         let Some(w) = self.worker.as_mut().filter(|w| w.in_flight) else { return };
         let d = w.rx.recv().expect("render thread died");
         w.in_flight = false;
+        d.core.gl_current(true);
         self.core = Some(d.core);
         self.spare_list = Some(d.list);
         self.spare_scene = Some(d.scene);
@@ -213,6 +217,8 @@ impl Renderer {
             return Err(e);
         }
         let core = self.core.take().expect("core home");
+        // ReNFS5: let the GL context go, for the render thread to take it
+        core.gl_current(false);
         let list = std::mem::replace(&mut self.list, self.spare_list.take().unwrap_or_default());
         self.list.barrier = 0;
         let mut copy = self.spare_scene.take().unwrap_or_default();

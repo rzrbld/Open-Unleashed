@@ -199,6 +199,8 @@ pub mod event {
     #[derive(Debug, Clone, PartialEq)]
     pub enum DeviceEvent {
         MouseMotion { delta: (f64, f64) },
+        Added,
+        Removed,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,7 +242,7 @@ pub mod monitor {
         }
         /// The display's modes as SDL2 lists them. A fullscreen handheld window keeps the panel's
         /// mode whatever is picked (the game renders at the window's size).
-        pub fn video_modes(&self) -> impl Iterator<Item = VideoModeHandle> {
+        pub fn video_modes(&self) -> impl Iterator<Item = VideoModeHandle> + use<> {
             crate::sdl::display_modes(self.display).into_iter()
         }
         pub fn size(&self) -> PhysicalSize<u32> {

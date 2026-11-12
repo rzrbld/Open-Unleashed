@@ -23,7 +23,7 @@ pub mod speech;
 pub mod voice_loop;
 pub mod voicechat;
 
-pub use mixer::{AudioOutput, PlayArgs, StopHandle, VoiceId};
+pub use mixer::{AudioOutput, Backend, PlayArgs, StopHandle, VoiceId};
 
 /// TEST GLUE (not in the original): the game tick the app is running, for the audio's debug lines
 /// only (`RE/notes/REFERENCE-2026-10-24-PA-AUDIOMIX.md`) — nothing reads it back.

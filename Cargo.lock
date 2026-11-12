@@ -779,7 +779,9 @@ dependencies = [
  "libm",
  "nfs-assets",
  "nfs-formats",
+ "sdl2-sys",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -848,9 +850,12 @@ name = "nfs-renderer"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "ash",
  "bytemuck",
  "glam",
+ "glow",
  "pollster",
+ "raw-window-handle",
  "tracing",
  "wgpu",
  "winit-sdl2",
@@ -1877,8 +1882,6 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b7fb58561a792bc237628ba0792e332de418fefe145f13b5ed8201e6d52f58"
 dependencies = [
  "android_system_properties",
  "arrayvec",
