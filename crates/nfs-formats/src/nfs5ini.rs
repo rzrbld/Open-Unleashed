@@ -106,8 +106,17 @@ impl Nfs5Ini {
 
     /// Read `<dir>/nfs5.ini` (the exe's directory); a missing or unreadable file gives the defaults.
     pub fn load(dir: &std::path::Path) -> Self {
-        let Some(p) = crate::ci_file::find_file(dir, "nfs5.ini") else { return Self::default() };
-        std::fs::read(p).map(|b| Self::parse(&String::from_utf8_lossy(&b))).unwrap_or_default()
+        let mut ini = match crate::ci_file::find_file(dir, "nfs5.ini") {
+            Some(p) => std::fs::read(p).map(|b| Self::parse(&String::from_utf8_lossy(&b))).unwrap_or_default(),
+            None => Self::default(),
+        };
+        // ReNFS5: the handheld launcher's MOVIES setting (`NFS5_SKIP_MOVIES=1` = `NoMovies=1`)
+        match std::env::var("NFS5_SKIP_MOVIES").ok().as_deref().map(str::trim) {
+            Some("1") => ini.no_movies = true,
+            Some("0") => ini.no_movies = false,
+            _ => {}
+        }
+        ini
     }
 }
 
