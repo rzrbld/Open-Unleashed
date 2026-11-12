@@ -17,7 +17,8 @@
 //! and the read-backs (`render_to_image`) are the one thing that does: they need
 //! the core in hand, so they first take it back (waiting for the frame in flight) and run the list.
 
-use crate::gpu::{Core, MaterialId, MeshId, OffscreenSpec, TextureId};
+use crate::backend::Core;
+use crate::gpu::{MaterialId, MeshId, OffscreenSpec, TextureId};
 use crate::{Camera, FakeSortMode, LensRead, MaterialDesc, MeshData, Scene, TextureData, Vertex};
 use anyhow::Result;
 use std::collections::HashMap;

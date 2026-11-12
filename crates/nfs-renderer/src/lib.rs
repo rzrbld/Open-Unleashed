@@ -22,6 +22,9 @@ pub(crate) fn point_filter() -> bool {
 
 mod camera;
 mod front;
+mod backend;
+mod gl_core;
+mod gl_shaders;
 mod gpu;
 mod sdl_target;
 mod prof;

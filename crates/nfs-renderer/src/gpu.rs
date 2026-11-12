@@ -1144,6 +1144,11 @@ impl Core {
         self.surface.make_current(current);
     }
 
+    /// ReNFS5: drawing through wgpu's GL backend (a Vulkan window that fell back to GLES).
+    pub(crate) fn is_gl(&self) -> bool {
+        self.surface.is_gl()
+    }
+
     pub(crate) fn take_lens(&mut self) -> Vec<LensRead> {
         std::mem::take(&mut self.lens_done)
     }
