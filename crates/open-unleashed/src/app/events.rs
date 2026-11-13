@@ -760,8 +760,9 @@ impl ApplicationHandler for App {
                     tracing::debug!(keys = ?self.input.pad_menu, "front end: pad keys");
                 }
                 // ReNFS5: an input dialog (the player's name) takes the pad as a letter wheel
-                if self.pad_text_entry(event_loop) {
-                    self.input.pad_menu.clear();
+                let rest = self.pad_text_entry(event_loop);
+                if let Some(rest) = rest {
+                    self.input.pad_menu = rest;
                 }
                 // ReNFS5: the d-pad means focus mode — A is Enter on the focused widget; the stick
                 // means pointer mode — A is the click (`pad_pointer`), never both
@@ -1039,8 +1040,7 @@ impl App {
             (if v > 9000.0 { (v - 9000.0) / 23767.0 } else if v < -9000.0 { (v + 9000.0) / 23767.0 } else { 0.0 }).clamp(-1.0, 1.0)
         };
         let (fx, fy) = (axis(p.sticks[0]), axis(p.sticks[1]));
-        // a text box takes A as a letter (`pad_text_entry`), not a click
-        let a = p.button(nfs_input::gamepad::Button::South) && self.pad_text_target().is_none();
+        let a = p.button(nfs_input::gamepad::Button::South);
         let (sw, sh) = (size.width.max(1) as f64, size.height.max(1) as f64);
         let (moved, pos, press, release) = PAD_POINTER.with(|c| {
             let mut c = c.borrow_mut();
@@ -1112,13 +1112,17 @@ impl App {
     }
 
     /// ReNFS5: the pad types into the active text box in `gptokeyb2`'s `text_input` layout — up /
-    /// down turn the last letter through [`NAME_WHEEL`], right or A adds one, left or B takes one
-    /// off, L1 / R1 turn ten letters, Start is Enter — as key events through the game's own
-    /// keyboard path (its filters, sounds and the OK button's enable). `true` when a box took the
-    /// pad's keys.
-    pub(crate) fn pad_text_entry(&mut self, event_loop: &ActiveEventLoop) -> bool {
+    /// down turn the last letter through [`NAME_WHEEL`], right adds one, left (or B while there is
+    /// text) takes one off, L1 / R1 turn ten letters, Start is Enter (and the player screen's OK) —
+    /// as key events through the game's own keyboard path (its filters, sounds and the OK button's
+    /// enable). A stays the pointer's click and B on an empty box the menu's back, so the box never
+    /// traps the pad. `Some(the keys it left)` while a box is active.
+    pub(crate) fn pad_text_entry(&mut self, event_loop: &ActiveEventLoop) -> Option<Vec<nfs_input::MenuNav>> {
         use winit::keyboard::{Key, NamedKey};
-        let Some((_, digits)) = self.pad_text_target() else { return false };
+        let Some((_, digits)) = self.pad_text_target() else { return None };
+        // the keys the box does not take go on to the menu as usual (A clicks, B backs out of an
+        // empty box, …)
+        let mut rest = Vec::new();
         let wheel: Vec<char> = if digits { "0123456789".chars().collect() } else { NAME_WHEEL.chars().collect() };
         let keys = self.input.pad_menu.clone();
         let char_key = |c: char| if c == ' ' { (Key::Named(NamedKey::Space), " ".to_string()) } else { (Key::Character(c.to_string().into()), c.to_string()) };
@@ -1145,11 +1149,12 @@ impl App {
                 continue;
             }
             match k {
-                nfs_input::MenuNav::Right | nfs_input::MenuNav::Select => {
+                nfs_input::MenuNav::Right => {
                     let (key, t) = char_key(wheel[0]);
                     self.pad_type(event_loop, key, Some(&t));
                 }
-                nfs_input::MenuNav::Left | nfs_input::MenuNav::Back => self.pad_type(event_loop, Key::Named(NamedKey::Backspace), None),
+                nfs_input::MenuNav::Left => self.pad_type(event_loop, Key::Named(NamedKey::Backspace), None),
+                nfs_input::MenuNav::Back if !text.is_empty() => self.pad_type(event_loop, Key::Named(NamedKey::Backspace), None),
                 nfs_input::MenuNav::Start => {
                     self.pad_type(event_loop, Key::Named(NamedKey::Enter), Some("\r"));
                     // the name typed, Start also presses the screen's OK — `createplayer`'s
@@ -1159,16 +1164,16 @@ impl App {
                         tracing::info!("pad: Start presses the player screen's OK");
                         self.fe.layout_sel = i;
                         self.layout_key(MenuKey::Enter, event_loop);
-                        break;
+                        return Some(Vec::new());
                     }
                 }
-                _ => {}
+                other => rest.push(other),
             }
             if self.pad_text_target().is_none() {
                 break;
             }
         }
-        true
+        Some(rest)
     }
 }
 
