@@ -170,8 +170,8 @@ fn make_window(title: &str, size: PhysicalSize<u32>, api: GfxApi, fullscreen: bo
             sys::SDL_GL_SetAttribute(A::SDL_GL_GREEN_SIZE, 8);
             sys::SDL_GL_SetAttribute(A::SDL_GL_BLUE_SIZE, 8);
             sys::SDL_GL_SetAttribute(A::SDL_GL_ALPHA_SIZE, 0);
-            // wgpu draws into its own textures (with its own depth); the window only receives the blit
-            sys::SDL_GL_SetAttribute(A::SDL_GL_DEPTH_SIZE, 0);
+            // the native GLES renderer draws straight into the window: it needs its depth buffer
+            sys::SDL_GL_SetAttribute(A::SDL_GL_DEPTH_SIZE, 24);
             sys::SDL_GL_SetAttribute(A::SDL_GL_STENCIL_SIZE, 0);
             sys::SDL_GL_SetAttribute(A::SDL_GL_DOUBLEBUFFER, 1);
         }

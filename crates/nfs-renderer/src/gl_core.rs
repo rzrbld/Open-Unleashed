@@ -211,6 +211,7 @@ pub(crate) struct GlCore {
     materials: Vec<GlMat>,
     white: TextureId,
     programs: HashMap<u32, MeshProg>,
+    failed_programs: std::collections::HashSet<u32>,
     sprite_progs: [SpriteProg; 2],
     gamma_prog: (glow::Program, Option<glow::UniformLocation>),
     samplers: [glow::Sampler; 8],
@@ -384,6 +385,7 @@ impl GlCore {
                 materials: Vec::new(),
                 white: TextureId(0),
                 programs: HashMap::new(),
+                failed_programs: Default::default(),
                 sprite_progs: [SpriteProg { prog: sprite_plain }, SpriteProg { prog: sprite_test }],
                 gamma_prog: (gamma, gamma_loc),
                 samplers: samplers.try_into().map_err(|_| anyhow!("samplers"))?,
@@ -783,12 +785,16 @@ impl GlCore {
     }
 
     fn mesh_program(&mut self, key: u32) -> Option<u32> {
+        if self.failed_programs.contains(&key) {
+            return None;
+        }
         if !self.programs.contains_key(&key) {
             let (vs, fs) = gl_shaders::mesh_sources(key);
             let p = match compile(&self.gl, &vs, &fs, &[(0, "a_pos"), (1, "a_normal"), (2, "a_uv"), (3, "a_color")]) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(key = format_args!("{key:#x}"), error = %e, "mesh program");
+                    self.failed_programs.insert(key);
                     return None;
                 }
             };

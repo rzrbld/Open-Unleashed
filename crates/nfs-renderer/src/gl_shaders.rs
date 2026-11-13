@@ -220,8 +220,9 @@ const MESH_FS: &str = r#"
 precision mediump float;
 precision highp int;
 uniform sampler2D t_diffuse;
-uniform vec4 u_light;
-uniform vec4 u_misc;
+// shared with the vertex stage: same precision
+uniform highp vec4 u_light;
+uniform highp vec4 u_misc;
 // rgb the fog's colour, w its density
 uniform vec4 u_fog;
 in vec2 v_uv;
