@@ -226,6 +226,11 @@ impl LayoutScreen {
 
     /// What the input box bound to `accessor` holds — `accessor->vt[0x10]()`, the string
     /// accessor's buffer (empty until something is typed; the buffers go with the screen).
+    /// ReNFS5: what input box `index` holds now (the pad's letter wheel reads its last letter).
+    pub fn edit_text(&self, index: usize) -> String {
+        self.edits.get(&index).cloned().unwrap_or_default()
+    }
+
     pub fn input_text(&self, accessor: &str) -> String {
         self.layout
             .elements

@@ -753,7 +753,7 @@ impl ApplicationHandler for App {
                 // goes back on a layout screen. (The pad's other keys are the port's own on both.)
                 let text_menu = self.fe.layout_preview.is_none();
                 // ReNFS5: an input dialog (the player's name) takes the pad as a letter wheel
-                if self.pad_name_entry() {
+                if self.pad_text_entry(event_loop) {
                     self.input.pad_menu.clear();
                 }
                 // ReNFS5: the d-pad means focus mode — A is Enter on the focused widget; the stick
@@ -1032,7 +1032,8 @@ impl App {
             (if v > 9000.0 { (v - 9000.0) / 23767.0 } else if v < -9000.0 { (v + 9000.0) / 23767.0 } else { 0.0 }).clamp(-1.0, 1.0)
         };
         let (fx, fy) = (axis(p.sticks[0]), axis(p.sticks[1]));
-        let a = p.button(nfs_input::gamepad::Button::South);
+        // a text box takes A as a letter (`pad_text_entry`), not a click
+        let a = p.button(nfs_input::gamepad::Button::South) && self.pad_text_target().is_none();
         let (sw, sh) = (size.width.max(1) as f64, size.height.max(1) as f64);
         let (moved, pos, press, release) = PAD_POINTER.with(|c| {
             let mut c = c.borrow_mut();
@@ -1073,23 +1074,49 @@ impl App {
 const NAME_WHEEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
 
 impl App {
-    /// ReNFS5: an input dialog's field from the pad (a handheld has no keyboard): up / down turn the
-    /// last letter through [`NAME_WHEEL`] (digits only in a digits field), right adds a letter,
-    /// left takes one off, A is the dialog's Enter. `true` when a field took the pad's keys.
-    pub(crate) fn pad_name_entry(&mut self) -> bool {
-        let Some((d, _)) = self.fe.dialog.as_mut() else { return false };
-        if !d.up {
-            return false;
+    /// ReNFS5: the text the active text box holds — an input dialog's field, or the screen's focused
+    /// input box (`createplayer`'s name) — and whether it takes digits only. `None`: no text box.
+    pub(crate) fn pad_text_target(&self) -> Option<(String, bool)> {
+        if let Some((d, _)) = self.fe.dialog.as_ref().filter(|(d, _)| d.up)
+            && let Some(f) = d.field.as_ref()
+        {
+            return Some((f.text.clone(), f.digits));
         }
-        let Some(f) = d.field.as_ref() else { return false };
-        let digits = f.digits;
+        let l = self.fe.layout_preview.as_ref()?;
+        let i = l.focused_input()?;
+        Some((l.edit_text(i), false))
+    }
+
+    /// ReNFS5: one key into the window's keyboard path, as `gptokeyb2`'s text input types it.
+    fn pad_type(&mut self, event_loop: &ActiveEventLoop, key: winit::keyboard::Key, text: Option<&str>) {
+        use winit::event::{DeviceId, ElementState, KeyEvent};
+        use winit::keyboard::{KeyCode, KeyLocation, NamedKey, PhysicalKey};
+        let Some(id) = self.window.as_ref().map(|w| w.id()) else { return };
+        let physical = match &key {
+            winit::keyboard::Key::Named(NamedKey::Backspace) => PhysicalKey::Code(KeyCode::Backspace),
+            winit::keyboard::Key::Named(NamedKey::Enter) => PhysicalKey::Code(KeyCode::Enter),
+            winit::keyboard::Key::Named(NamedKey::Space) => PhysicalKey::Code(KeyCode::Space),
+            _ => PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+        };
+        for state in [ElementState::Pressed, ElementState::Released] {
+            let event = KeyEvent { physical_key: physical, logical_key: key.clone(), text: if state == ElementState::Pressed { text.map(Into::into) } else { None }, location: KeyLocation::Standard, state, repeat: false };
+            self.window_event(event_loop, id, WindowEvent::KeyboardInput { device_id: DeviceId::dummy(), event, is_synthetic: false });
+        }
+    }
+
+    /// ReNFS5: the pad types into the active text box in `gptokeyb2`'s `text_input` layout — up /
+    /// down turn the last letter through [`NAME_WHEEL`], right or A adds one, left or B takes one
+    /// off, L1 / R1 turn ten letters, Start is Enter — as key events through the game's own
+    /// keyboard path (its filters, sounds and the OK button's enable). `true` when a box took the
+    /// pad's keys.
+    pub(crate) fn pad_text_entry(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        let Some((_, digits)) = self.pad_text_target() else { return false };
         let wheel: Vec<char> = if digits { "0123456789".chars().collect() } else { NAME_WHEEL.chars().collect() };
         let keys = self.input.pad_menu.clone();
-        let mut sound = None;
-        // gptokeyb2's `text_input` layout: up / down the letter, right or A adds one, left or B takes
-        // one off, L1 / R1 ten letters, Start finishes (the dialog's Enter)
+        let char_key = |c: char| if c == ' ' { (Key::Named(NamedKey::Space), " ".to_string()) } else { (Key::Character(c.to_string().into()), c.to_string()) };
         for k in keys {
-            let text = d.field.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+            let text = self.pad_text_target().map(|t| t.0).unwrap_or_default();
             let turn = match k {
                 nfs_input::MenuNav::Up => Some(wheel.len() - 1),
                 nfs_input::MenuNav::Down => Some(1),
@@ -1098,25 +1125,30 @@ impl App {
                 _ => None,
             };
             if let Some(step) = turn {
-                match text.chars().last() {
-                    None => sound = d.type_char(wheel[0]).or(sound),
+                let next = match text.chars().last() {
+                    None => wheel[0],
                     Some(c) => {
                         let i = wheel.iter().position(|w| *w == c.to_ascii_uppercase()).unwrap_or(0);
-                        d.backspace();
-                        sound = d.type_char(wheel[(i + step) % wheel.len()]).or(sound);
+                        self.pad_type(event_loop, Key::Named(NamedKey::Backspace), None);
+                        wheel[(i + step) % wheel.len()]
                     }
-                }
+                };
+                let (key, t) = char_key(next);
+                self.pad_type(event_loop, key, Some(&t));
                 continue;
             }
             match k {
-                nfs_input::MenuNav::Right | nfs_input::MenuNav::Select => sound = d.type_char(wheel[0]).or(sound),
-                nfs_input::MenuNav::Left | nfs_input::MenuNav::Back => sound = d.backspace().or(sound),
-                nfs_input::MenuNav::Start => sound = d.enter().or(sound),
+                nfs_input::MenuNav::Right | nfs_input::MenuNav::Select => {
+                    let (key, t) = char_key(wheel[0]);
+                    self.pad_type(event_loop, key, Some(&t));
+                }
+                nfs_input::MenuNav::Left | nfs_input::MenuNav::Back => self.pad_type(event_loop, Key::Named(NamedKey::Backspace), None),
+                nfs_input::MenuNav::Start => self.pad_type(event_loop, Key::Named(NamedKey::Enter), Some("\r")),
                 _ => {}
             }
-        }
-        if let Some(n) = sound {
-            self.fe_sound(n as usize);
+            if self.pad_text_target().is_none() {
+                break;
+            }
         }
         true
     }

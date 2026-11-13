@@ -716,6 +716,16 @@ impl App {
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
     ) {
+        // ReNFS5 (handhelds, `NFS5_PAD_LAYOUT=1`): the race drives with the connected pad — the
+        // modern pad layout over whatever rows the profile kept (an old profile's DirectInput rows
+        // name devices a handheld does not have); the pad is the only controller there
+        if std::env::var("NFS5_PAD_LAYOUT").is_ok_and(|v| v.trim() == "1")
+            && let Some(pad) = self.input.pads.iter().position(|r| r.standard)
+        {
+            let id_of = |n: &str| accessors::controller_action(n).and_then(nfs_input::binding_id);
+            self.input.default_controls(Some(pad), id_of);
+            tracing::info!(pad, "race controls: the pad's layout (NFS5_PAD_LAYOUT)");
+        }
         self.enter_race_mode();
         // the launch dump 0x4B4DA0 (0x4B5179): `[0x657CA0]` = the `Audio.MusicLevel` accessor
         self.snd.registry_music_level = self.snd.audio_settings.music_level;
