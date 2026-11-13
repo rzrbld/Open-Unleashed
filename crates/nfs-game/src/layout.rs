@@ -376,6 +376,10 @@ pub struct LayoutScreen {
     /// 0x4D1E70 on every layer but the top; a covered screen's widgets answer `isDisabled` and draw
     /// `[state.disabled]` where their template has it (§4.147)
     covered: bool,
+    /// ReNFS5: a dialog is up over this screen — its pointer is drawn after the dialog
+    /// ([`Self::pointer_over_dialog`]), not with the screen's own sprites, so it is not hidden
+    /// under the dialog's box
+    pointer_on_top: bool,
     /// `(combo element, row)` — the open drop-down's hovered row, kept from the last frame the
     /// pointer was actually on the list. The original keeps it in `[this+0x1A8]` with
     /// `[this+0x1A4]` as "there is one", and **`FEComboBox`'s leave handler 0x4C6F00 does not
@@ -1254,7 +1258,7 @@ impl LayoutScreen {
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
         let classes: Vec<WidgetClass> = layout.elements.iter().map(|e| WidgetClass::from_class(&e.class)).collect();
         let hoverable: Vec<bool> = layout.elements.iter().map(|e| controls.get(&e.class).is_some_and(|c| c.has_state("hover"))).collect();
-        let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), overlay_mask: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
+        let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, pointer_on_top: false, combo_hover: std::cell::Cell::new(None), overlay_mask: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
             // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
             // part way through an animation the front end would otherwise only show in motion
             clock_ms: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs, parts_glyphs,
@@ -2983,6 +2987,22 @@ impl LayoutScreen {
         self.covered = on;
     }
 
+    /// ReNFS5: a dialog is up over this screen: its pointer leaves the screen's sprites for
+    /// [`Self::pointer_over_dialog`], drawn after the dialog.
+    pub fn set_pointer_on_top(&mut self, on: bool) {
+        self.pointer_on_top = on;
+    }
+
+    /// ReNFS5: the pointer, drawn last — after a dialog's box, which otherwise covered it. Empty
+    /// unless [`Self::set_pointer_on_top`] is on.
+    pub fn pointer_over_dialog(&self, aspect: f32) -> Vec<Sprite> {
+        let mut out = Vec::new();
+        if self.pointer_on_top {
+            self.cursor_sprite(&mut out, aspect, None);
+        }
+        out
+    }
+
     fn state_hidden_or_disabled(&self, i: usize) -> bool {
         if self.is_hidden(i) || self.disabled_flags.contains(&i) {
             return true;
@@ -4128,8 +4148,11 @@ impl LayoutScreen {
             fe_depth::apply(&mut overlay[b..c], m.inside);
         }
         out.append(&mut overlay);
-        // last of all, over the tooltip and the drop-down alike
-        self.cursor_sprite(&mut out, aspect, hovered);
+        // last of all, over the tooltip and the drop-down alike — or, with a dialog up, after the
+        // dialog (`pointer_over_dialog`)
+        if !self.pointer_on_top {
+            self.cursor_sprite(&mut out, aspect, hovered);
+        }
         out
     }
 }

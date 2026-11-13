@@ -1,6 +1,7 @@
 //! Race/game state reconstructed from the original (see `RE/ARCHITECTURE.md`).
 //! Currently: start-grid extraction and scene assembly for tracks and cars.
 //! Race logic (checkpoints, laps, positions) follows M5.
+pub mod player_picture;
 pub mod ai;
 pub mod aidrive;
 pub mod camera;

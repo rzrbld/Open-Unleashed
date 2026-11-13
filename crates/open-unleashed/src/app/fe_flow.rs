@@ -203,6 +203,18 @@ impl App {
 
     /// One frame of the dialog: the tick, the answer kept for `fe_dialog_answer`, the screens
     /// covered while it is up.
+    /// The bottom bar's cover for an open layer (0x4D1F4C) as far as its **buttons** are concerned:
+    /// none. ReNFS5 deviation from the port's earlier reading: 0x4D1E70 does set the bar's `[+0x261]`
+    /// (0x4E08C0) with more than one layer, but a widget is disabled by a cover only through its
+    /// `[+0x114]`, the `__RTDynamicCast` of its parent to `FEMenu` (0x4C7542…0x4C7554, 0x4C7E4C…0x4C7E62),
+    /// and the bar's own refresh decides BACK and OPTIONS by the layers itself (0x4D6320, 0x4D63A0) —
+    /// which it would not need if the cover already disabled them. Covered, the host lobby (a layer
+    /// over the main menu: `GameSetup.lay`'s multiplayer button opens `selectname` with offset 1) kept
+    /// RACE disabled and no LAN race could start; the original (the recomp) starts them there.
+    pub(crate) fn bar_layer_cover(&self) -> bool {
+        false
+    }
+
     pub(crate) fn fe_dialog_step(&mut self) {
         let now = self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref()).map(|l| l.ticks()).unwrap_or(0);
         let mut answer = None;
@@ -221,12 +233,15 @@ impl App {
         // a 3D car zoomed into a door covers every screen each tick too (0x4C052F → 0x4D2000),
         // and lets them go through 0x4D20F0 (= 0x4D1E70) when it zooms back out
         let zoomed = self.fe.layout_preview.as_ref().is_some_and(|l| l.car_3d().iter().any(|w| l.car_zoom(w.index).1));
+        let dialog_up = up;
         let up = up || zoomed;
         if let Some(l) = self.fe.layout_preview.as_mut() {
             l.set_covered(up);
+            // ReNFS5: the pointer goes over the dialog, not under it
+            l.set_pointer_on_top(dialog_up);
         }
         // 0x4D1E70 also covers the bottom bar while more than one layer is open (0x4D1F4C)
-        let layered = self.fe.nav.bottom_covered();
+        let layered = self.bar_layer_cover();
         if let Some(b) = self.fe.layout_bottom.as_mut() {
             b.set_covered(up || layered);
         }
@@ -292,7 +307,7 @@ impl App {
             },
         };
         let account = self.fe.game_type == game_type::TOURNAMENT && !slot_ac(&list);
-        let layered = self.fe.nav.bottom_covered();
+        let layered = self.bar_layer_cover();
         let Some(b) = self.fe.layout_bottom.as_mut() else { return };
         // 0x4D1E70 after the open: the bar is covered while more than one layer is open
         // (0x4D1F4C), which disables every button whose template has the state (0x4C7E62);
@@ -318,6 +333,7 @@ impl App {
         let Some(b) = self.fe.layout_bottom.as_ref() else { return false };
         let Some(hit) = b.hovered() else { return false };
         if b.widget_disabled(hit) {
+            tracing::info!(widget = hit, "bottom bar: click on a disabled button");
             return true;
         }
         let Some(c) = b.controls().into_iter().find(|c| c.index == hit) else { return false };

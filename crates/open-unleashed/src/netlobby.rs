@@ -334,7 +334,17 @@ impl App {
 
     /// **0x5091B0** — the create screen's PLAYGAME gate: every player ready, nobody in the race.
     pub(crate) fn net_can_start(&self) -> bool {
-        self.net.session.as_ref().is_some_and(|n| n.everyone_ready())
+        let ok = self.net.session.as_ref().is_some_and(|n| n.everyone_ready());
+        // ReNFS5 diagnostic: the PLAYGAME gate's inputs, once a second while it says no
+        if !ok && let Some(n) = self.net.session.as_ref() {
+            thread_local! { static T: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) }; }
+            if T.with(|t| t.get().is_none_or(|i| i.elapsed().as_secs() >= 1)) {
+                T.with(|t| t.set(Some(std::time::Instant::now())));
+                let ready: Vec<(i32, Option<bool>)> = n.room.players.iter().map(|p| (p.id, usize::try_from(p.id).ok().and_then(|i| n.slots.slot.get(i)).map(|s| s.ready))).collect();
+                tracing::info!(established = n.established(), in_race = n.in_race, ?ready, "PLAYGAME gate closed");
+            }
+        }
+        ok
     }
 
     /// `Comms.PlayerList`'s rows as **0x4BBEB0** draws them: with the connection up, the row number

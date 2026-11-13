@@ -929,9 +929,16 @@ impl App {
         // 0x427A60, the race load 0x4B67B0's first call (before its steps 1 and 2): `pic16.fsh` from
         // the HUD folder posted as file type 0, for the others' `HLeader` and their loading screen's
         // rows (the port posted it with the seats, after step 5)
+        // — the profile's own picture: `SaveData\pic16.fsh` as 0x4DBBA0 writes it from `AllDrivr.fsh`
+        // (`nfs_game::player_picture`), the shipped `DashHud` one only when that cannot be made
+        let picture = usize::from(self.career.as_ref().map_or(nfs_game::save::DEFAULT_PICTURE, |c| c.profile.picture));
+        let own = GamePaths::find_file(&self.paths.fe_data().join("Art"), "ALLdrivr.fsh")
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|all| nfs_game::player_picture::pic16_fsh(&all, picture));
         if let Some(n) = self.net.session.as_mut()
-            && let Some(b) = GamePaths::find_file(&self.paths.game_data().join("DashHud"), "pic16.fsh").and_then(|p| std::fs::read(p).ok())
+            && let Some(b) = own.or_else(|| GamePaths::find_file(&self.paths.game_data().join("DashHud"), "pic16.fsh").and_then(|p| std::fs::read(p).ok()))
         {
+            tracing::info!(target: "netplay", picture, bytes = b.len(), "the player's picture posted (0x427A60)");
             n.post_picture(&b);
         }
         // 0x4B67D8 / 0x4B67DF: steps 1 and 2 straight after 0x427A60, with nothing between them
