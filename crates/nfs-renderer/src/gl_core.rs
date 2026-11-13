@@ -55,6 +55,10 @@ struct GlMesh {
     /// ReNFS5: an arena mesh's vertices once it is rewritten — it then has buffers of its own,
     /// re-specified whole per write (`write_mesh`)
     shadow: Option<Vec<u8>>,
+    /// ReNFS5: the stream third its VAO reads from, when it reads from the stream
+    stream_seg: Option<usize>,
+    /// ReNFS5: an arena mesh's own (not rebased) indices, kept for `promote_mesh`
+    local_indices: Option<Box<[u32]>>,
 }
 
 struct Arena {
@@ -244,6 +248,8 @@ pub(crate) struct GlCore {
     stream: Option<StreamRing>,
     /// ReNFS5: every arena chunk's element buffer by its vertex buffer (`promote_mesh` reads any)
     arena_ibos: HashMap<glow::Buffer, glow::Buffer>,
+    /// ReNFS5: compiled mesh programs on disk (`NFS5_SHADER_CACHE`)
+    shader_cache: Option<ShaderCache>,
     offscreen: HashMap<u32, (u32, u32)>,
     offscreen_fbos: HashMap<u32, Offscreen>,
     depth_rbs: HashMap<(u32, u32), glow::Renderbuffer>,
@@ -284,6 +290,8 @@ fn compile(gl: &glow::Context, vs: &str, fs: &str, attribs: &[(u32, &str)]) -> R
         for (i, name) in attribs {
             gl.bind_attrib_location(p, *i, name);
         }
+        // ReNFS5: the linked program is saved to the shader cache (`ShaderCache`)
+        gl.program_binary_retrievable_hint(p, true);
         gl.link_program(p);
         if !gl.get_program_link_status(p) {
             return Err(anyhow!("program link: {}", gl.get_program_info_log(p)));
@@ -423,6 +431,7 @@ impl GlCore {
                 lens_async: false,
                 stream: None,
                 arena_ibos: HashMap::new(),
+                shader_cache: ShaderCache::open(&renderer, &version),
                 offscreen: HashMap::new(),
                 offscreen_fbos: HashMap::new(),
                 depth_rbs: HashMap::new(),
@@ -516,6 +525,64 @@ impl GlCore {
                 self.gl.delete_sync(f);
             }
         }
+        // a mesh not rewritten since it went into this third still reads from it: back into its
+        // own buffer before the third is filled with this frame's writes (else it would draw
+        // another mesh's vertices — stray triangles)
+        let seg = r.seg;
+        let mut residents = std::mem::take(&mut r.residents[seg]);
+        if env_off("NFS5_REHOME") {
+            residents.clear();
+        }
+        for id in residents {
+            let Some(m) = self.meshes.get_mut(id as usize) else { continue };
+            if m.stream_seg != Some(seg) {
+                continue;
+            }
+            m.stream_seg = None;
+            let (vao, vbo) = (m.vao, m.vbo);
+            let Some(shadow) = m.shadow.as_ref() else { continue };
+            // SAFETY: the mesh's own buffer, re-specified (no wait), and its VAO pointed back
+            unsafe {
+                self.gl.bind_vertex_array(None);
+                self.st.vao = None;
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, shadow, glow::STREAM_DRAW);
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                Self::point_vao(&self.gl, vao, vbo, 0);
+            }
+        }
+    }
+
+    /// TEST GLUE (ReNFS5): `NFS5_FRAME_DUMP=<dir>` writes every `NFS5_FRAME_DUMP_EVERY`th (30) window
+    /// frame as `<dir>/f<frame>.ppm`, read back before the swap — the real frame path, for comparing
+    /// builds pixel by pixel with `NFS5_FIXED_DT_MS`.
+    fn frame_dump(&mut self, w: u32, h: u32) {
+        static DIR: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some((dir, every)) = DIR.get_or_init(|| {
+            let d = std::env::var("NFS5_FRAME_DUMP").ok()?;
+            let e = std::env::var("NFS5_FRAME_DUMP_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(30u64).max(1);
+            let _ = std::fs::create_dir_all(&d);
+            Some((d, e))
+        }) else { return };
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % every != 0 {
+            return;
+        }
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        // SAFETY: a read of the window's framebuffer
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.read_pixels(0, 0, w as i32, h as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut px)));
+        }
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for y in (0..h).rev() {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                out.extend_from_slice(&px[o..o + 3]);
+            }
+        }
+        let _ = std::fs::write(format!("{dir}/f{n:05}.ppm"), out);
     }
 
     /// ReNFS5: the end of a window frame: the stream's current third is fenced.
@@ -642,7 +709,7 @@ impl GlCore {
                 self.gl.buffer_sub_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, a.iused as i32, bytemuck::cast_slice(&indices));
             }
             self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            self.meshes.push(GlMesh { vao: a.vao, vbo: a.vbo, index_offset: a.iused, index_count: mesh.indices.len() as u32, vertex_offset: a.vused, vertex_len: vlen, dynamic_size: None, writes: 0, shadow: None });
+            self.meshes.push(GlMesh { vao: a.vao, vbo: a.vbo, index_offset: a.iused, index_count: mesh.indices.len() as u32, vertex_offset: a.vused, vertex_len: vlen, dynamic_size: None, writes: 0, shadow: None, stream_seg: None, local_indices: Some(mesh.indices.clone().into_boxed_slice()) });
             a.vused += vreserve;
             a.iused += ireserve;
         }
@@ -670,7 +737,7 @@ impl GlCore {
             let vao = self.make_vao(vbo, ibo);
             let mut shadow = vbytes.to_vec();
             shadow.resize(vlen as usize, 0);
-            self.meshes.push(GlMesh { vao, vbo, index_offset: 0, index_count: mesh.indices.len() as u32, vertex_offset: 0, vertex_len: vlen, dynamic_size: Some(vlen), writes: 0, shadow: Some(shadow) });
+            self.meshes.push(GlMesh { vao, vbo, index_offset: 0, index_count: mesh.indices.len() as u32, vertex_offset: 0, vertex_len: vlen, dynamic_size: Some(vlen), writes: 0, shadow: Some(shadow), stream_seg: None, local_indices: None });
         }
         MeshId(self.meshes.len() as u32 - 1)
     }
@@ -683,14 +750,23 @@ impl GlCore {
         // ReNFS5: a write into the shared arena makes the Mali driver wait for (or copy) the whole
         // arena while the GPU still draws from it — 44 writes a frame cost 50 ms frames in the Alps.
         // The mesh moves to buffers of its own on its first write instead.
-        if m.dynamic_size.is_none() && m.shadow.is_none() {
+        if m.dynamic_size.is_none() && m.local_indices.is_some() && !env_off("NFS5_PROMOTE") {
             self.promote_mesh(id);
+        }
+        let full = bytes.len() as u64 >= self.meshes[id as usize].vertex_len;
+        if self.meshes[id as usize].dynamic_size.is_some() && self.meshes[id as usize].shadow.is_none() && !full {
+            // a part-write of a promoted mesh with no kept copy yet: its vertices read back once
+            self.read_back_shadow(id);
         }
         let m = &mut self.meshes[id as usize];
         m.writes = m.writes.wrapping_add(1);
-        if let Some(shadow) = m.shadow.as_mut() {
-            let n = bytes.len().min(shadow.len());
-            shadow[..n].copy_from_slice(&bytes[..n]);
+        match m.shadow.as_mut() {
+            Some(shadow) => {
+                let n = bytes.len().min(shadow.len());
+                shadow[..n].copy_from_slice(&bytes[..n]);
+            }
+            None if full && m.dynamic_size.is_some() => m.shadow = Some(bytes[..m.vertex_len as usize].to_vec()),
+            None => {}
         }
         if self.stream_write(id) {
             return;
@@ -704,6 +780,7 @@ impl GlCore {
             if m.shadow.is_some() {
                 Self::point_vao(&self.gl, m.vao, m.vbo, 0);
             }
+            m.stream_seg = None;
             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(m.vbo));
             if let Some(shadow) = m.shadow.as_mut() {
                 self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, shadow, glow::STREAM_DRAW);
@@ -737,16 +814,23 @@ impl GlCore {
                 self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 self.gl.buffer_data_size(glow::ARRAY_BUFFER, (STREAM_SEG_SIZE * STREAM_SEGS as u64) as i32, glow::STREAM_DRAW);
                 self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-                self.stream = Some(StreamRing { vbo, seg_size: STREAM_SEG_SIZE, seg: 0, cursor: 0, fences: [None, None, None] });
+                self.stream = Some(StreamRing { vbo, seg_size: STREAM_SEG_SIZE, seg: 0, cursor: 0, fences: [None, None, None], residents: Default::default() });
             }
         }
         let r = self.stream.as_mut().expect("stream");
         let at = r.cursor.next_multiple_of(64);
         if at + len > (r.seg as u64 + 1) * r.seg_size {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(segment_mb = r.seg_size >> 20, "vertex stream full this frame: the rest of the writes take the slow path");
+            }
             return false;
         }
         r.cursor = at + len;
+        let seg = r.seg;
+        r.residents[seg].push(id);
         let vbo = r.vbo;
+        self.meshes[id as usize].stream_seg = Some(seg);
         let m = &self.meshes[id as usize];
         let shadow = m.shadow.as_ref().expect("shadow");
         // SAFETY: a range of the stream no draw in flight reads (its third's fence has passed);
@@ -782,50 +866,27 @@ impl GlCore {
         }
     }
 
-    /// ReNFS5: give arena mesh `id` a vertex buffer, an index buffer and a VAO of its own, its
-    /// vertices kept on the CPU (`GlMesh::shadow`). Reads the arena back once (one wait, on the
-    /// mesh's first write); without that read it stays in the arena.
+    /// ReNFS5: give arena mesh `id` a vertex buffer, an index buffer and a VAO of its own. The
+    /// vertices are copied GPU to GPU and the indices come from the copy kept at upload, so nothing
+    /// waits for the GPU (reading the arena back cost 200 ms when a few hundred meshes moved at once).
     fn promote_mesh(&mut self, id: u32) {
-        let Some(m) = self.meshes.get(id as usize) else { return };
-        let (vlen, ioff, icount, voff) = (m.vertex_len as usize, m.index_offset as i32, m.index_count as usize, m.vertex_offset);
-        let avbo = m.vbo;
-        let Some(&aibo) = self.arena_ibos.get(&avbo) else { return };
-        let base = (voff / VERTEX_STRIDE) as u32;
-        // SAFETY: GL buffer work on the current context; the mapped ranges are inside the arena's
-        // buffers and unmapped before use
+        let Some(m) = self.meshes.get_mut(id as usize) else { return };
+        let Some(local) = m.local_indices.take() else { return };
+        let (vlen, voff, avbo) = (m.vertex_len, m.vertex_offset, m.vbo);
+        // SAFETY: GL buffer work on the current context: a copy inside the GPU, then new objects
         unsafe {
             self.gl.bind_vertex_array(None);
             self.st.vao = None;
-            let mut verts = vec![0u8; vlen];
-            let mut idx = vec![0u8; icount * 4];
-            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(avbo));
-            if vlen > 0 {
-                let p = self.gl.map_buffer_range(glow::ARRAY_BUFFER, voff as i32, vlen as i32, glow::MAP_READ_BIT);
-                if p.is_null() {
-                    self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-                    return;
-                }
-                std::ptr::copy_nonoverlapping(p, verts.as_mut_ptr(), vlen);
-                self.gl.unmap_buffer(glow::ARRAY_BUFFER);
-            }
-            self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            if !idx.is_empty() {
-                self.gl.bind_buffer(glow::COPY_READ_BUFFER, Some(aibo));
-                let p = self.gl.map_buffer_range(glow::COPY_READ_BUFFER, ioff, idx.len() as i32, glow::MAP_READ_BIT);
-                if p.is_null() {
-                    self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
-                    return;
-                }
-                std::ptr::copy_nonoverlapping(p, idx.as_mut_ptr(), idx.len());
-                self.gl.unmap_buffer(glow::COPY_READ_BUFFER);
-                self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
-            }
-            // the arena's indices are rebased onto the arena: back to the mesh's own
-            let local: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&idx).iter().map(|i| i.wrapping_sub(base)).collect();
             let vbo = self.gl.create_buffer().expect("buffer");
             let ibo = self.gl.create_buffer().expect("buffer");
-            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, if verts.is_empty() { &[0; 4] } else { &verts }, glow::STREAM_DRAW);
+            self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, Some(vbo));
+            self.gl.buffer_data_size(glow::COPY_WRITE_BUFFER, vlen.max(4) as i32, glow::STREAM_DRAW);
+            if vlen > 0 {
+                self.gl.bind_buffer(glow::COPY_READ_BUFFER, Some(avbo));
+                self.gl.copy_buffer_sub_data(glow::COPY_READ_BUFFER, glow::COPY_WRITE_BUFFER, voff as i32, 0, vlen as i32);
+                self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+            }
+            self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
             self.gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ibo));
             let ib: &[u8] = bytemuck::cast_slice(&local);
             self.gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, if ib.is_empty() { &[0; 4] } else { ib }, glow::STATIC_DRAW);
@@ -835,8 +896,29 @@ impl GlCore {
             m.vbo = vbo;
             m.index_offset = 0;
             m.vertex_offset = 0;
-            m.shadow = Some(verts);
+            m.dynamic_size = Some(vlen);
         }
+    }
+
+    /// The vertices of promoted mesh `id` read back into its kept copy (only for a part-write before
+    /// any whole write — waits for the GPU once).
+    fn read_back_shadow(&mut self, id: u32) {
+        let m = &self.meshes[id as usize];
+        let (vbo, vlen) = (m.vbo, m.vertex_len as usize);
+        let mut v = vec![0u8; vlen];
+        // SAFETY: a range of the mesh's own buffer, mapped for reading and unmapped
+        unsafe {
+            self.gl.bind_vertex_array(None);
+            self.st.vao = None;
+            self.gl.bind_buffer(glow::COPY_READ_BUFFER, Some(vbo));
+            let p = self.gl.map_buffer_range(glow::COPY_READ_BUFFER, 0, vlen as i32, glow::MAP_READ_BIT);
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(p, v.as_mut_ptr(), vlen);
+                self.gl.unmap_buffer(glow::COPY_READ_BUFFER);
+            }
+            self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+        }
+        self.meshes[id as usize].shadow = Some(v);
     }
 
     pub fn upload_texture_mips(&mut self, width: u32, height: u32, mips: &[Vec<u8>]) -> TextureId {
@@ -1022,11 +1104,50 @@ impl GlCore {
         }
     }
 
+    /// ReNFS5: every program the shader cache holds, loaded now (the first draw) — a cached program
+    /// is not compiled mid-race (a Mali compile is 60–80 ms, a visible hitch).
+    fn preload_programs(&mut self) {
+        let Some(c) = self.shader_cache.as_mut() else { return };
+        if c.preloaded {
+            return;
+        }
+        c.preloaded = true;
+        let keys = c.keys();
+        let t0 = std::time::Instant::now();
+        let mut n = 0;
+        for key in keys {
+            if !self.programs.contains_key(&key) && self.load_cached_program(key) {
+                n += 1;
+            }
+        }
+        tracing::info!(programs = n, ms = t0.elapsed().as_millis() as u64, "shader cache loaded");
+    }
+
+    /// The program `key` from the shader cache, when it holds one for these sources and this driver.
+    fn load_cached_program(&mut self, key: u32) -> bool {
+        let (vs, fs) = gl_shaders::mesh_sources(key);
+        let Some(c) = self.shader_cache.as_ref() else { return false };
+        let Some(bin) = c.load(key, &vs, &fs) else { return false };
+        // SAFETY: a program object of this context, given a binary this driver produced
+        let p = unsafe {
+            let Ok(p) = self.gl.create_program() else { return false };
+            self.gl.program_binary(p, &bin);
+            if !self.gl.get_program_link_status(p) {
+                self.gl.delete_program(p);
+                return false;
+            }
+            p
+        };
+        self.adopt_program(key, p);
+        true
+    }
+
     fn mesh_program(&mut self, key: u32) -> Option<u32> {
         if self.failed_programs.contains(&key) {
             return None;
         }
-        if !self.programs.contains_key(&key) {
+        self.preload_programs();
+        if !self.programs.contains_key(&key) && !self.load_cached_program(key) {
             let (vs, fs) = gl_shaders::mesh_sources(key);
             let p = match compile(&self.gl, &vs, &fs, &[(0, "a_pos"), (1, "a_normal"), (2, "a_uv"), (3, "a_color")]) {
                 Ok(p) => p,
@@ -1036,6 +1157,21 @@ impl GlCore {
                     return None;
                 }
             };
+            if let Some(c) = self.shader_cache.as_ref() {
+                // SAFETY: the program just linked
+                if let Some(bin) = unsafe { self.gl.get_program_binary(p) } {
+                    c.save(key, &vs, &fs, &bin);
+                }
+            }
+            tracing::info!(key = format_args!("{key:#x}"), programs = self.programs.len() + 1, "mesh program compiled");
+            self.adopt_program(key, p);
+        }
+        Some(key)
+    }
+
+    /// A linked mesh program into `programs`: its samplers bound to their units, its uniforms found.
+    fn adopt_program(&mut self, key: u32, p: glow::Program) {
+        {
             let gl = &self.gl;
             // SAFETY: the program just linked
             unsafe {
@@ -1068,10 +1204,8 @@ impl GlCore {
                 shadow_v: Uni::new(gl, p, "u_shadow_v"),
                 pass: u64::MAX,
             };
-            tracing::info!(key = format_args!("{key:#x}"), programs = self.programs.len() + 1, "mesh program compiled");
             self.programs.insert(key, mp);
         }
-        Some(key)
     }
 
     // ---- frames ------------------------------------------------------------------------------
@@ -1140,6 +1274,7 @@ impl GlCore {
             self.gamma_resolve(None, w, h);
         }
         crate::hitch::mark("gl_draw");
+        self.frame_dump(w, h);
         self.stream_fence();
         self.window.gl_swap();
         crate::hitch::mark("swap");
@@ -1649,7 +1784,7 @@ fn lens_block_pixels(block: &[u8; 64], flip: bool) -> [u32; 16] {
 
 /// ReNFS5: the vertex stream: one buffer in three per-frame thirds, each fenced at its frame's end.
 const STREAM_SEGS: usize = 3;
-const STREAM_SEG_SIZE: u64 = 4 << 20;
+const STREAM_SEG_SIZE: u64 = 12 << 20;
 
 struct StreamRing {
     vbo: glow::Buffer,
@@ -1657,4 +1792,82 @@ struct StreamRing {
     seg: usize,
     cursor: u64,
     fences: [Option<glow::Fence>; STREAM_SEGS],
+    /// the meshes whose vertices each third holds (a later write elsewhere moves them)
+    residents: [Vec<u32>; STREAM_SEGS],
+}
+
+/// `NAME=0` in the environment (test switches).
+fn env_off(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v.trim() == "0")
+}
+
+/// ReNFS5: the mesh programs the driver compiled, kept on disk (`NFS5_SHADER_CACHE`, the port puts it
+/// in `configs/shader-cache`) so a later run loads them instead of compiling mid-race. A file holds
+/// one program, tagged with a hash of the driver's identity and the program's sources: another
+/// driver or another build's shaders do not match and are compiled again (and the file replaced).
+struct ShaderCache {
+    dir: std::path::PathBuf,
+    driver: String,
+    preloaded: bool,
+}
+
+const SHADER_CACHE_MAGIC: &[u8; 8] = b"NFS5PB1\0";
+
+impl ShaderCache {
+    fn open(renderer: &str, version: &str) -> Option<Self> {
+        let dir = std::path::PathBuf::from(std::env::var_os("NFS5_SHADER_CACHE").filter(|v| !v.is_empty())?);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Self { dir, driver: format!("{renderer}|{version}"), preloaded: false })
+    }
+
+    fn path(&self, key: u32) -> std::path::PathBuf {
+        self.dir.join(format!("mesh-{key:08x}.bin"))
+    }
+
+    fn tag(&self, vs: &str, fs: &str) -> u64 {
+        // FNV-1a over the driver and the sources
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in self.driver.bytes().chain([0u8]).chain(vs.bytes()).chain([0u8]).chain(fs.bytes()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    fn keys(&self) -> Vec<u32> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        rd.filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            u32::from_str_radix(name.strip_prefix("mesh-")?.strip_suffix(".bin")?, 16).ok()
+        })
+        .collect()
+    }
+
+    fn load(&self, key: u32, vs: &str, fs: &str) -> Option<glow::ProgramBinary> {
+        let d = std::fs::read(self.path(key)).ok()?;
+        if d.len() < 24 || &d[..8] != SHADER_CACHE_MAGIC || u64::from_le_bytes(d[8..16].try_into().ok()?) != self.tag(vs, fs) {
+            return None;
+        }
+        let format = u32::from_le_bytes(d[16..20].try_into().ok()?);
+        let len = u32::from_le_bytes(d[20..24].try_into().ok()?) as usize;
+        let buffer = d.get(24..24 + len)?.to_vec();
+        Some(glow::ProgramBinary { buffer, format })
+    }
+
+    fn save(&self, key: u32, vs: &str, fs: &str, bin: &glow::ProgramBinary) {
+        if bin.buffer.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(24 + bin.buffer.len());
+        out.extend_from_slice(SHADER_CACHE_MAGIC);
+        out.extend_from_slice(&self.tag(vs, fs).to_le_bytes());
+        out.extend_from_slice(&bin.format.to_le_bytes());
+        out.extend_from_slice(&(bin.buffer.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bin.buffer);
+        // written beside and renamed: a run cut off mid-write leaves no torn file
+        let tmp = self.path(key).with_extension("tmp");
+        if std::fs::write(&tmp, &out).is_ok() {
+            let _ = std::fs::rename(&tmp, self.path(key));
+        }
+    }
 }

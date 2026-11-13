@@ -75,6 +75,12 @@ impl App {
     /// never for a real hitch (over four refreshes). `NFS5_DISPLAY_DT=0` turns it off;
     /// `NFS5_REFRESH_HZ` overrides the display mode's rate.
     pub(crate) fn display_dt(&self, raw: Duration) -> Duration {
+        // TEST GLUE (ReNFS5): `NFS5_FIXED_DT_MS=<ms>` — every frame advances the game by exactly this,
+        // so two builds draw the same frames (compared with `NFS5_FRAME_DUMP`)
+        static FIXED: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+        if let Some(ms) = *FIXED.get_or_init(|| std::env::var("NFS5_FIXED_DT_MS").ok().and_then(|v| v.trim().parse().ok())) {
+            return Duration::from_secs_f64(ms / 1000.0);
+        }
         thread_local! {
             static S: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
         }
