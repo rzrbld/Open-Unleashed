@@ -240,6 +240,10 @@ pub(crate) struct GlCore {
     lens_pbos: Vec<glow::Buffer>,
     /// the window frame (`render`) reads asynchronously; stills and images keep the direct read
     lens_async: bool,
+    /// ReNFS5: the per-frame vertex stream for rewritten meshes (`write_mesh`)
+    stream: Option<StreamRing>,
+    /// ReNFS5: every arena chunk's element buffer by its vertex buffer (`promote_mesh` reads any)
+    arena_ibos: HashMap<glow::Buffer, glow::Buffer>,
     offscreen: HashMap<u32, (u32, u32)>,
     offscreen_fbos: HashMap<u32, Offscreen>,
     depth_rbs: HashMap<(u32, u32), glow::Renderbuffer>,
@@ -417,6 +421,8 @@ impl GlCore {
                 lens_pending: Vec::new(),
                 lens_pbos: Vec::new(),
                 lens_async: false,
+                stream: None,
+                arena_ibos: HashMap::new(),
                 offscreen: HashMap::new(),
                 offscreen_fbos: HashMap::new(),
                 depth_rbs: HashMap::new(),
@@ -497,7 +503,31 @@ impl GlCore {
     pub(crate) fn gl_current(&self, current: bool) {
         self.window.gl_make_current(current);
     }
-    pub(crate) fn frame_begin(&mut self) {}
+    /// ReNFS5: the next third of the vertex stream, once the GPU is done with it (its fence was
+    /// set three frames ago, so this wait is normally none).
+    pub(crate) fn frame_begin(&mut self) {
+        let Some(r) = self.stream.as_mut() else { return };
+        r.seg = (r.seg + 1) % STREAM_SEGS;
+        r.cursor = r.seg as u64 * r.seg_size;
+        if let Some(f) = r.fences[r.seg].take() {
+            // SAFETY: a fence of this context
+            unsafe {
+                self.gl.client_wait_sync(f, glow::SYNC_FLUSH_COMMANDS_BIT, 1_000_000_000);
+                self.gl.delete_sync(f);
+            }
+        }
+    }
+
+    /// ReNFS5: the end of a window frame: the stream's current third is fenced.
+    fn stream_fence(&mut self) {
+        let Some(r) = self.stream.as_mut() else { return };
+        // SAFETY: a fence on the current context
+        if let Ok(f) = unsafe { self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) } {
+            if let Some(old) = r.fences[r.seg].replace(f) {
+                unsafe { self.gl.delete_sync(old) };
+            }
+        }
+    }
 
     pub(crate) fn apply(&mut self, list: &mut CmdList) {
         let CmdList { cmds, bytes, .. } = list;
@@ -595,6 +625,7 @@ impl GlCore {
                 self.gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ibo));
                 self.gl.buffer_data_size(glow::ELEMENT_ARRAY_BUFFER, icap as i32, glow::STATIC_DRAW);
                 let vao = self.make_vao(vbo, ibo);
+                self.arena_ibos.insert(vbo, ibo);
                 self.arena = Some(Arena { vao, vbo, ibo, vused: 0, iused: 0, vcap, icap });
             }
             let a = self.arena.as_mut().expect("arena");
@@ -637,7 +668,9 @@ impl GlCore {
             let ib: &[u8] = bytemuck::cast_slice(&mesh.indices);
             self.gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, if ib.is_empty() { &[0; 4] } else { ib }, glow::STATIC_DRAW);
             let vao = self.make_vao(vbo, ibo);
-            self.meshes.push(GlMesh { vao, vbo, index_offset: 0, index_count: mesh.indices.len() as u32, vertex_offset: 0, vertex_len: vlen, dynamic_size: Some(vlen), writes: 0, shadow: None });
+            let mut shadow = vbytes.to_vec();
+            shadow.resize(vlen as usize, 0);
+            self.meshes.push(GlMesh { vao, vbo, index_offset: 0, index_count: mesh.indices.len() as u32, vertex_offset: 0, vertex_len: vlen, dynamic_size: Some(vlen), writes: 0, shadow: Some(shadow) });
         }
         MeshId(self.meshes.len() as u32 - 1)
     }
@@ -655,14 +688,24 @@ impl GlCore {
         }
         let m = &mut self.meshes[id as usize];
         m.writes = m.writes.wrapping_add(1);
+        if let Some(shadow) = m.shadow.as_mut() {
+            let n = bytes.len().min(shadow.len());
+            shadow[..n].copy_from_slice(&bytes[..n]);
+        }
+        if self.stream_write(id) {
+            return;
+        }
+        let m = &mut self.meshes[id as usize];
         // SAFETY: GL buffer work on the current context
         unsafe {
+            // the stream is full or unusable: the mesh's own buffer, the VAO pointed back at it
+            self.gl.bind_vertex_array(None);
+            self.st.vao = None;
+            if m.shadow.is_some() {
+                Self::point_vao(&self.gl, m.vao, m.vbo, 0);
+            }
             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(m.vbo));
             if let Some(shadow) = m.shadow.as_mut() {
-                // the written prefix over the kept vertices, the whole buffer re-specified: the
-                // driver gives the GPU's copy its own storage instead of waiting
-                let n = bytes.len().min(shadow.len());
-                shadow[..n].copy_from_slice(&bytes[..n]);
                 self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, shadow, glow::STREAM_DRAW);
             } else if let Some(size) = m.dynamic_size {
                 // a fresh allocation for this frame's vertices: the buffer the last frames drew
@@ -676,14 +719,77 @@ impl GlCore {
         }
     }
 
+    /// ReNFS5: mesh `id`'s kept vertices into this frame's third of the vertex stream — a mapped
+    /// write that never waits (the third is fenced off from the GPU's use) — and its VAO pointed
+    /// there. `false` when the stream cannot take it.
+    fn stream_write(&mut self, id: u32) -> bool {
+        if std::env::var("NFS5_STREAM").is_ok_and(|v| v.trim() == "0") {
+            return false;
+        }
+        let len = match self.meshes.get(id as usize).and_then(|m| m.shadow.as_ref()) {
+            Some(sh) if !sh.is_empty() => sh.len() as u64,
+            _ => return false,
+        };
+        if self.stream.is_none() {
+            // SAFETY: a buffer of this context
+            unsafe {
+                let Ok(vbo) = self.gl.create_buffer() else { return false };
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                self.gl.buffer_data_size(glow::ARRAY_BUFFER, (STREAM_SEG_SIZE * STREAM_SEGS as u64) as i32, glow::STREAM_DRAW);
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                self.stream = Some(StreamRing { vbo, seg_size: STREAM_SEG_SIZE, seg: 0, cursor: 0, fences: [None, None, None] });
+            }
+        }
+        let r = self.stream.as_mut().expect("stream");
+        let at = r.cursor.next_multiple_of(64);
+        if at + len > (r.seg as u64 + 1) * r.seg_size {
+            return false;
+        }
+        r.cursor = at + len;
+        let vbo = r.vbo;
+        let m = &self.meshes[id as usize];
+        let shadow = m.shadow.as_ref().expect("shadow");
+        // SAFETY: a range of the stream no draw in flight reads (its third's fence has passed);
+        // mapped, filled and unmapped before any draw
+        unsafe {
+            self.gl.bind_vertex_array(None);
+            self.st.vao = None;
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let p = self.gl.map_buffer_range(glow::ARRAY_BUFFER, at as i32, len as i32, glow::MAP_WRITE_BIT | glow::MAP_UNSYNCHRONIZED_BIT | glow::MAP_INVALIDATE_RANGE_BIT);
+            if p.is_null() {
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(shadow.as_ptr(), p, len as usize);
+            self.gl.unmap_buffer(glow::ARRAY_BUFFER);
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            Self::point_vao(&self.gl, m.vao, vbo, at);
+        }
+        true
+    }
+
+    /// Point a mesh VAO's four attributes at `buffer` from byte `base` (its element buffer stays).
+    unsafe fn point_vao(gl: &glow::Context, vao: glow::VertexArray, buffer: glow::Buffer, base: u64) {
+        unsafe {
+            gl.bind_vertex_array(Some(vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer));
+            let s = VERTEX_STRIDE as i32;
+            for (i, n, off) in [(0u32, 3, 0i32), (1, 3, 12), (2, 2, 24), (3, 4, 32)] {
+                gl.vertex_attrib_pointer_f32(i, n, glow::FLOAT, false, s, base as i32 + off);
+            }
+            gl.bind_vertex_array(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
+    }
+
     /// ReNFS5: give arena mesh `id` a vertex buffer, an index buffer and a VAO of its own, its
     /// vertices kept on the CPU (`GlMesh::shadow`). Reads the arena back once (one wait, on the
     /// mesh's first write); without that read it stays in the arena.
     fn promote_mesh(&mut self, id: u32) {
         let Some(m) = self.meshes.get(id as usize) else { return };
         let (vlen, ioff, icount, voff) = (m.vertex_len as usize, m.index_offset as i32, m.index_count as usize, m.vertex_offset);
-        let Some(a) = self.arena.as_ref().filter(|a| a.vbo == m.vbo) else { return };
-        let (avbo, aibo) = (a.vbo, a.ibo);
+        let avbo = m.vbo;
+        let Some(&aibo) = self.arena_ibos.get(&avbo) else { return };
         let base = (voff / VERTEX_STRIDE) as u32;
         // SAFETY: GL buffer work on the current context; the mapped ranges are inside the arena's
         // buffers and unmapped before use
@@ -1034,6 +1140,7 @@ impl GlCore {
             self.gamma_resolve(None, w, h);
         }
         crate::hitch::mark("gl_draw");
+        self.stream_fence();
         self.window.gl_swap();
         crate::hitch::mark("swap");
         self.stats_draws_report();
@@ -1538,4 +1645,16 @@ fn lens_block_pixels(block: &[u8; 64], flip: bool) -> [u32; 16] {
         }
     }
     pixels
+}
+
+/// ReNFS5: the vertex stream: one buffer in three per-frame thirds, each fenced at its frame's end.
+const STREAM_SEGS: usize = 3;
+const STREAM_SEG_SIZE: u64 = 4 << 20;
+
+struct StreamRing {
+    vbo: glow::Buffer,
+    seg_size: u64,
+    seg: usize,
+    cursor: u64,
+    fences: [Option<glow::Fence>; STREAM_SEGS],
 }
