@@ -83,8 +83,12 @@ impl App {
         self.mirror_sky_update();
         self.mirror_weather_step();
         self.frames += 1;
+        frame_pace_sample(false);
         if self.fps_timer.elapsed() >= Duration::from_secs(1) {
-            tracing::info!(fps = self.frames, tick = self.tick, "frame stats");
+            match frame_pace_sample(true) {
+                Some((p50, p99, max, over20)) => tracing::info!(fps = self.frames, tick = self.tick, p50_ms = p50, p99_ms = p99, max_ms = max, over20ms = over20, "frame stats"),
+                None => tracing::info!(fps = self.frames, tick = self.tick, "frame stats"),
+            }
             LAST_FPS.store(self.frames as u32, std::sync::atomic::Ordering::Relaxed);
             // **PLATFORM GLUE** (not in the original): `NFS_DEMO=1` shows the frame rate, the GPU / graphics API and the
             // platform in the window title, for demo recordings (and keeps the window on top, `session.rs`)
@@ -409,4 +413,33 @@ static LAST_FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 fn fps_overlay_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("NFS5_FPS_OVERLAY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// ReNFS5: frame-to-frame times for the once-a-second `frame stats` line — median, 99th
+/// percentile and worst in ms, and how many frames took over 20 ms (a missed 60 Hz vsync).
+/// `Some` once a second (the window then restarts), for judging smoothness, not just the average.
+fn frame_pace_sample(take: bool) -> Option<(f32, f32, f32, usize)> {
+    use std::cell::RefCell;
+    thread_local! {
+        static S: RefCell<(Option<Instant>, Vec<f32>)> = const { RefCell::new((None, Vec::new())) };
+    }
+    S.with(|c| {
+        let mut c = c.borrow_mut();
+        if !take {
+            let now = Instant::now();
+            if let Some(prev) = c.0 {
+                c.1.push((now - prev).as_secs_f32() * 1000.0);
+            }
+            c.0 = Some(now);
+            return None;
+        }
+        if c.1.is_empty() {
+            return None;
+        }
+        let mut v = std::mem::take(&mut c.1);
+        v.sort_by(f32::total_cmp);
+        let at = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
+        let r = |x: f32| (x * 10.0).round() / 10.0;
+        Some((r(at(0.5)), r(at(0.99)), r(*v.last().unwrap()), v.iter().filter(|&&m| m > 20.0).count()))
+    })
 }

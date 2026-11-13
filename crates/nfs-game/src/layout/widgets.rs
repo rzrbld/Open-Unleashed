@@ -761,8 +761,18 @@ impl LayoutScreen {
         // constructor 0x4D7E70 at 0x4D39C4, the first layout 0x4D67D0 only after).)*
         let rects = self.state_rects(e, state).len();
         let shapes = self.shape_parts_at(e, state, frame).into_iter().filter(|(_, _, f, n, _)| self.shapes.contains_key(&(f.clone(), *n))).count();
-        let mask = super::fe_depth::mask_begin();
         let caption = (first + rects + shapes).min(out.len());
+        // a disabled button's picture is drawn through the template's disabled colour,
+        // `disabledlabel.foreColor` 0xff808080 — half brightness: the original's main menu shows
+        // RACE at 123,96,21 where the art is 255,199,49 (recomp capture 2026-11-13)
+        if state == "disabled" {
+            for sp in &mut out[(first + rects).min(caption)..caption] {
+                for c in &mut sp.color[..3] {
+                    *c *= 128.0 / 255.0;
+                }
+            }
+        }
+        let mask = super::fe_depth::mask_begin();
         super::fe_depth::apply(&mut out[caption..], mask.stencil);
         if hovered == Some(i) && state != "disabled" && self.widget_progress() * 255 / TRANS_FULL == 0 {
             let glint = out.len();

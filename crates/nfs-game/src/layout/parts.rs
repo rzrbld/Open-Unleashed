@@ -664,12 +664,10 @@ impl LayoutScreen {
             // 0x4C9BDE…0x4C9BED, with the x left alone (0x4C9BFD). Three of `bottombar.lay`'s four
             // buttons — back, options and exit, the three with an icon — carry **6**; the other
             // nineteen shipped bar buttons carry 0. §4.80.
-            let py = py
-                + if name == "picture" && e.class == "NFS5.BOTTOMBARBUTTON" {
-                    self.attr_num(e, "picoffy").unwrap_or(0.0)
-                } else {
-                    0.0
-                };
+            // ReNFS5: `BottomBarButton.ctr`'s `part.picture` is already `pos.value=0,data.picoffy`,
+            // so `pos` above carries the offset once; adding it again here put the back / options /
+            // exit icons 6 px under their captions, where the original lines them up (recomp
+            // capture 2026-11-13: icon and caption centred on the same row).
             // `flip` is the part's own attribute — `Graphic Tab Button.ctr` writes
             // `flip.value=data.flipit`, so the widget's `flipit` mirrors the tab's art
             let flip = self
