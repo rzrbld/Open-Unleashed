@@ -116,6 +116,8 @@ pub enum Button {
 
 /// The port's own `Gamepads` state (the SDL context lives in [`Devices`]).
 pub struct Gamepads {
+    /// ReNFS5: controller button-downs seen (the intro movies' skip)
+    button_presses: u32,
     devices: Option<Devices>,
     /// the left stick's X / Y past [`MENU_STICK`] at the last motion event (the front end's keys)
     stick_latch: [bool; 2],
@@ -270,6 +272,16 @@ impl Devices {
             let id = sys::SDL_JoystickGetDeviceInstanceID(index);
             if id >= 0 && self.list.iter().any(|d| d.id == id) {
                 return Some(id);
+            }
+            // ReNFS5: `NFS5_PAD_ONLY=vvvv:pppp` (hex USB ids) — read that pad alone: under PortMaster
+            // gptokeyb turns the handheld's controls into a virtual Xbox 360 pad (045e:028e), and
+            // the physical device beside it would send every press twice
+            if let Some((v, p)) = pad_only() {
+                let (dv, dp) = (sys::SDL_JoystickGetDeviceVendor(index), sys::SDL_JoystickGetDeviceProduct(index));
+                if (dv, dp) != (v, p) {
+                    tracing::info!(vendor = format_args!("{dv:04x}"), product = format_args!("{dp:04x}"), "joystick skipped (NFS5_PAD_ONLY)");
+                    return None;
+                }
             }
             let joy = sys::SDL_JoystickOpen(index);
             if joy.is_null() {
@@ -551,7 +563,7 @@ impl Gamepads {
                 None
             }
         };
-        Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false }
+        Self { devices, stick_latch: [false; 2], rumbler: Default::default(), rumble_test: None, records_buf: Vec::new(), haptic_armed: false, ff_hotplug: false, pad_hotplug: false, button_presses: 0 }
     }
 
     /// Whether a device that can rumble or has SDL haptic effects was connected since the last call
@@ -566,6 +578,11 @@ impl Gamepads {
     /// gives untouched keyboard rows the pad's layout).
     pub fn take_pad_hotplug(&mut self) -> bool {
         std::mem::take(&mut self.pad_hotplug)
+    }
+
+    /// ReNFS5: whether a controller button went down since the last call (sticks never count).
+    pub fn take_button_press(&mut self) -> bool {
+        std::mem::take(&mut self.button_presses) > 0
     }
 
     /// Whether a pad that can rumble is connected (`SDL_JoystickHasRumble`, see [`Device::can_rumble`]).
@@ -742,6 +759,9 @@ impl Gamepads {
                     // stick past 0.6 of its travel (latched, one key per push)
                     let b = unsafe { ev.cbutton };
                     quit_combo(b.which, b.button);
+                    if d.pad_index(b.which).is_some() {
+                        self.button_presses = self.button_presses.wrapping_add(1);
+                    }
                     if let Some(i) = d.pad_index(b.which)
                         && let Some(button) = controller_button(b.button)
                         && let Some(k) = menu_button(button, &d.list[i].face)
@@ -750,7 +770,8 @@ impl Gamepads {
                     }
                 } else if ty == EV_CONTROLLERAXISMOTION {
                     let a = unsafe { ev.caxis };
-                    if d.pad_index(a.which).is_none() {
+                    // ReNFS5: with the pad pointer the left stick moves the pointer, not the focus
+                    if d.pad_index(a.which).is_none() || pad_mouse_on() {
                         continue;
                     }
                     let axis = i32::from(a.axis);
@@ -779,6 +800,23 @@ impl Gamepads {
         input.set_pads(&records);
         self.records_buf = records;
     }
+}
+
+/// ReNFS5: the pad pointer (the recomp's `pad_mouse`): the left stick moves the front end's pointer
+/// and A clicks; on unless `NFS5_PAD_MOUSE=0`.
+pub fn pad_mouse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NFS5_PAD_MOUSE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// ReNFS5: `NFS5_PAD_ONLY`'s `vendor:product`, parsed once.
+fn pad_only() -> Option<(u16, u16)> {
+    static ONLY: std::sync::OnceLock<Option<(u16, u16)>> = std::sync::OnceLock::new();
+    *ONLY.get_or_init(|| {
+        let v = std::env::var("NFS5_PAD_ONLY").ok()?;
+        let (a, b) = v.trim().split_once(':')?;
+        Some((u16::from_str_radix(a, 16).ok()?, u16::from_str_radix(b, 16).ok()?))
+    })
 }
 
 /// ReNFS5 (handhelds): **Select + Start** quits, the PortMaster convention (`gptokeyb`'s hotkey; the

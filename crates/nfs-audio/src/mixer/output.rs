@@ -225,7 +225,11 @@ unsafe extern "C" fn sdl_callback(userdata: *mut std::ffi::c_void, stream: *mut 
     core.lat.at.store(core.lat.epoch.elapsed().as_nanos() as u64 + 1, Ordering::Release);
     core.fill(out, ctx.channels, ctx.rate);
     core.publish();
+    DEVICE_FRAMES.fetch_add((n / ctx.channels.max(1)) as u64, Ordering::Relaxed);
 }
+
+/// ReNFS5 (diagnostics): the frames the output device has asked for since it opened.
+pub static DEVICE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn sdl_error() -> String {
     unsafe {

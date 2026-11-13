@@ -8,6 +8,7 @@ mod rt_cmd;
 use self::rt_cmd::*;
 
 mod output;
+pub use output::DEVICE_FRAMES;
 pub use self::output::*;
 
 mod stream;

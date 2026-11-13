@@ -6,11 +6,21 @@ impl App {
     /// The window's events while the start-up movies play: the player reads the keyboard ring for
     /// Esc (0x55FF60) and the mouse's buttons (0x5372A0(6)); nothing else is listening yet.
     fn intro_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        // ReNFS5 (handhelds): a pad button skips the movie as Esc does — the original reads only the
+        // keyboard and the mouse here, which a handheld does not have
+        let pad_skip = if matches!(event, WindowEvent::RedrawRequested) && self.intro.is_some() {
+            self.gamepads.poll(&mut self.input);
+            self.input.pad_menu.clear();
+            self.gamepads.take_button_press()
+        } else {
+            false
+        };
         let Some(run) = self.intro.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => run.renderer.resize(size.width, size.height),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
+                tracing::info!(key = ?event.physical_key, "intro: key");
                 run.key(event.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape));
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -20,13 +30,17 @@ impl App {
                     MouseButton::Middle => 2,
                     _ => 3,
                 };
+                tracing::info!(?button, ?state, "intro: mouse button");
                 run.button(i, state == ElementState::Pressed);
             }
             WindowEvent::RedrawRequested => {
                 // `NFS_PLAY_INTRO` on a scripted run: hold Esc down the way an impatient player
                 // would, through the same key path (`run.key`), so the walk reaches the front end
                 // without sitting through the whole movie.
-                if NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && PLAY_INTRO.load(std::sync::atomic::Ordering::Relaxed) {
+                if pad_skip {
+                    tracing::info!("intro: pad button, skip");
+                }
+                if pad_skip || (NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && PLAY_INTRO.load(std::sync::atomic::Ordering::Relaxed)) {
                     run.key(true);
                 }
                 if run.frame(self.snd.audio.as_ref(), &self.camera) {
@@ -721,6 +735,7 @@ impl ApplicationHandler for App {
                 // gamepad: d-pad / left stick moves, A (cross) selects, B backs — PORT-DEVIATION D10
                 // (PORT-DEVIATIONS.md) [the FE reads no pad, event pump 0x529700]
                 self.gamepads.poll(&mut self.input);
+                self.pad_pointer(event_loop);
                 if self.gamepads.take_pad_hotplug() {
                     self.pad_layout_if_untouched();
                 }
@@ -806,6 +821,10 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested if event_loop.exiting() => {}
             WindowEvent::RedrawRequested => {
                 self.gamepads.poll(&mut self.input);
+                // the pause menu and the results take the pointer too
+                if self.paused || self.vehicle.is_none() {
+                    self.pad_pointer(event_loop);
+                }
                 if self.gamepads.take_pad_hotplug() {
                     self.pad_layout_if_untouched();
                 }
@@ -959,6 +978,67 @@ impl ApplicationHandler for App {
                 self.draw_frame();
             }
             _ => {}
+        }
+    }
+}
+
+/// ReNFS5: the pad pointer's state — its place in window pixels, the last update and A.
+struct PadPointer {
+    pos: Option<(f64, f64)>,
+    last: std::time::Instant,
+    a: bool,
+}
+
+thread_local! {
+    static PAD_POINTER: std::cell::RefCell<PadPointer> = std::cell::RefCell::new(PadPointer { pos: None, last: std::time::Instant::now(), a: false });
+}
+
+impl App {
+    /// ReNFS5: the recomp's `pad_mouse` (`padkeys.c`): the left stick moves the pointer — a dead
+    /// zone of 9000, then up to 420 pixels a second on a 480-row screen (`NFS5_PAD_MOUSE_SPEED`) —
+    /// and A is the left button. Both go through the window's own mouse events, so hover, clicks
+    /// and the pointer the screens draw behave as with a mouse.
+    pub(crate) fn pad_pointer(&mut self, event_loop: &ActiveEventLoop) {
+        if !nfs_input::gamepad::pad_mouse_on() {
+            return;
+        }
+        let Some(w) = self.window.as_ref() else { return };
+        let (id, size) = (w.id(), w.inner_size());
+        let Some(p) = self.gamepads.pad_snapshot() else { return };
+        let speed: f64 = std::env::var("NFS5_PAD_MOUSE_SPEED").ok().and_then(|v| v.trim().parse().ok()).filter(|v: &f64| *v > 30.0).unwrap_or(420.0);
+        let axis = |v: i16| {
+            let v = v as f64;
+            (if v > 9000.0 { (v - 9000.0) / 23767.0 } else if v < -9000.0 { (v + 9000.0) / 23767.0 } else { 0.0 }).clamp(-1.0, 1.0)
+        };
+        let (fx, fy) = (axis(p.sticks[0]), axis(p.sticks[1]));
+        let a = p.button(nfs_input::gamepad::Button::South);
+        let (sw, sh) = (size.width.max(1) as f64, size.height.max(1) as f64);
+        let (moved, pos, press, release) = PAD_POINTER.with(|c| {
+            let mut c = c.borrow_mut();
+            let now = std::time::Instant::now();
+            let dt = now.duration_since(c.last).as_secs_f64().clamp(0.001, 0.1);
+            c.last = now;
+            let mut pos = c.pos.unwrap_or((sw / 2.0, sh / 2.0));
+            let moved = fx != 0.0 || fy != 0.0 || c.pos.is_none();
+            if moved {
+                let k = speed * sh / 480.0 * dt;
+                pos = ((pos.0 + fx * k).clamp(0.0, sw - 1.0), (pos.1 + fy * k).clamp(0.0, sh - 1.0));
+            }
+            c.pos = Some(pos);
+            let (press, release) = (a && !c.a, !a && c.a);
+            c.a = a;
+            (moved, pos, press, release)
+        });
+        use winit::event::{DeviceId, ElementState, MouseButton};
+        let device_id = DeviceId::dummy();
+        if moved || press || release {
+            self.window_event(event_loop, id, WindowEvent::CursorMoved { device_id, position: winit::dpi::PhysicalPosition::new(pos.0, pos.1) });
+        }
+        if press {
+            self.window_event(event_loop, id, WindowEvent::MouseInput { device_id, state: ElementState::Pressed, button: MouseButton::Left });
+        }
+        if release {
+            self.window_event(event_loop, id, WindowEvent::MouseInput { device_id, state: ElementState::Released, button: MouseButton::Left });
         }
     }
 }

@@ -26,6 +26,9 @@ struct Movie {
     video: Vec<std::ops::Range<usize>>,
     dec: MadDecoder,
     player: IntroPlayer<Vec<u8>>,
+    /// ReNFS5: when it was opened (its real duration, logged at the end)
+    opened: std::time::Instant,
+    logged: u64,
     voice: Option<nfs_audio::VoiceId>,
     size: (i32, i32),
     started: bool,
@@ -96,8 +99,10 @@ impl IntroRun {
         let first = video.first()?.clone();
         let h = MadHeader::parse(&data[first]).ok()?;
         let dec = MadDecoder::new(tables, &h);
+        let nominal_ms = (kinds.len() as u64 * h.period as u64) >> 16;
+        tracing::info!(path = %path.display(), frames = kinds.len(), period_ms = h.period as f64 / 65536.0, nominal_ms, "start-up movie");
         let player = IntroPlayer::new(kinds, h.period);
-        Some(Movie { data, video, dec, player, voice: None, size: (h.width as i32, h.height as i32), started: false })
+        Some(Movie { data, video, dec, player, voice: None, size: (h.width as i32, h.height as i32), started: false, opened: std::time::Instant::now(), logged: 0 })
     }
 
     /// One redraw. `true` once both movies are over.
@@ -146,13 +151,22 @@ impl IntroRun {
                     let clip = nfs_audio::mixer::Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None, gain: 1.0, bend_cents: 0, fx_send: pcm.fx_send, priority: nfs_audio::mixer::STREAM_PRIORITY, pan: pcm.pan, pan_scale: pcm.pan_scale, records: Vec::new(), layers: Vec::new(), tables: Vec::new() };
                     Some(a.play_word(Arc::new(clip), 1.0, nfs_audio::resample::PITCH_UNIT, 0x40, 0, false))
                 });
-                player.start(self.t0.elapsed().as_millis() as i32, voice.is_some());
+                // ReNFS5: `NFS5_MOVIE_CLOCK=wall` paces the frames by the real clock alone — some
+                // firmwares' audio path (muOS on the H700: `aplay` plays 10 s of 44.1 kHz in 8.5 s)
+                // consumes faster than real time, and a picture synced to it runs fast
+                let wall = std::env::var("NFS5_MOVIE_CLOCK").is_ok_and(|v| v.trim() == "wall");
+                player.start(self.t0.elapsed().as_millis() as i32, voice.is_some() && !wall);
             }
             // 0x566910's position (the frames mixed) less 0x56AFA0's latency (mixed and not yet
             // heard, `AudioOutput::latency_ms`) — 0x4DCC9E and the four other sync sites.
             // *(Until 2026-09-26 the port took the latency as 0.)*
             let pos = voice.and_then(|v| audio.and_then(|a| Some(a.position_ms(v)? - a.latency_ms())));
             let tick = Tick { now: self.t0.elapsed().as_millis() as i32, audio_pos: pos.unwrap_or(0), audio_done: pos.is_none() };
+            // ReNFS5: the movie clock against the wall clock, every 5 s (the device's audio clock drives it)
+            if m.opened.elapsed().as_millis() as u64 / 5000 != m.logged {
+                m.logged = m.opened.elapsed().as_millis() as u64 / 5000;
+                tracing::info!(wall_ms = m.opened.elapsed().as_millis() as u64, audio_ms = pos.unwrap_or(-1), latency_ms = audio.map_or(0, |a| a.latency_ms()), device_frames = nfs_audio::mixer::DEVICE_FRAMES.load(std::sync::atomic::Ordering::Relaxed), "movie clock");
+            }
             let (keys, buttons) = (&mut self.keys, self.buttons);
             let mut skip = || keys.pop_front().unwrap_or(false) | buttons.iter().any(|b| *b);
             let shown = player.step(tick, &mut decode, &mut skip);
@@ -169,7 +183,7 @@ impl IntroRun {
                 if let (Some(a), Some(v)) = (audio, m.voice) {
                     a.stop(v);
                 }
-                tracing::info!(dropped = m.player.dropped, "start-up movie over");
+                tracing::info!(dropped = m.player.dropped, wall_ms = m.opened.elapsed().as_millis() as u64, "start-up movie over");
                 self.movie = None;
             }
         }
