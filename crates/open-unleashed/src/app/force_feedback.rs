@@ -71,6 +71,13 @@ impl App {
     pub(crate) fn ff_arm(&mut self) {
         let _ = self.gamepads.take_ff_hotplug();
         self.gamepads.rumble_stop_all();
+        // ReNFS5: `NFS5_RUMBLE=1` (the launcher's VIBRATION) arms it; off otherwise — a handheld's
+        // rumble motor on every bump is more annoying than useful
+        if !std::env::var("NFS5_RUMBLE").is_ok_and(|v| v.trim() == "1") {
+            tracing::info!("force feedback: off (NFS5_RUMBLE is not 1)");
+            self.ff = Some(ForceFeedback::new(false, false));
+            return;
+        }
         // A1: a device with SDL haptic effects first (0x411D20 creates the four effects and sets the
         // device gain from `FF.TotalVolume`, 0x5333A0), else a pad's rumble
         if let Some(wheel) = self.gamepads.haptic_arm(self.ff_levels().total) {
