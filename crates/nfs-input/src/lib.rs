@@ -235,6 +235,10 @@ pub enum MenuNav {
     Alt,
     /// the standard pad's X (`face[3]`): the replay bar's "save" (PAD-END2, D10)
     Aux,
+    /// ReNFS5: Start, L1, R1 — the name entry's finish and ten-letter jumps (gptokeyb2's text input)
+    Start,
+    L1,
+    R1,
 }
 
 /// Current logical input state, updated from window events and sampled once per tick.

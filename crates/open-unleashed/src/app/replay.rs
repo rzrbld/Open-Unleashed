@@ -421,7 +421,7 @@ impl App {
             N::Down => (1, 1),
             N::Aux => (6, 1),
             N::Back => (3, 1),
-            N::Alt => return false,
+            N::Alt | N::Start | N::L1 | N::R1 => return false,
         };
         if !self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) || self.hud.is_none() {
             return false;

@@ -777,6 +777,7 @@ impl ApplicationHandler for App {
                             nfs_input::MenuNav::Back if text_menu => MenuKey::Back,
                             // Y and X are the race's dialog keys (PAD-END2), not the menus'
                             nfs_input::MenuNav::Back | nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux => return None,
+                            nfs_input::MenuNav::Start | nfs_input::MenuNav::L1 | nfs_input::MenuNav::R1 => return None,
                         })
                     })
                     .collect();
@@ -856,16 +857,23 @@ impl ApplicationHandler for App {
                         self.input.pad_menu.clear();
                     }
                     if self.paused && !self.input.pad_menu.is_empty() {
+                        // ReNFS5: as in the menus — the d-pad means focus mode (A is Enter), the stick
+                        // pointer mode (A is the click, `pad_pointer`)
+                        if self.input.pad_menu.iter().any(|k| matches!(k, nfs_input::MenuNav::Up | nfs_input::MenuNav::Down | nfs_input::MenuNav::Left | nfs_input::MenuNav::Right)) {
+                            PAD_POINTER.with(|c| c.borrow_mut().focus_mode = true);
+                        }
+                        let focus_mode = !nfs_input::gamepad::pad_mouse_on() || PAD_POINTER.with(|c| c.borrow().focus_mode);
                         for k in std::mem::take(&mut self.input.pad_menu) {
                             let key = match k {
                                 nfs_input::MenuNav::Up => MenuKey::Up,
                                 nfs_input::MenuNav::Down => MenuKey::Down,
                                 nfs_input::MenuNav::Left => MenuKey::Left,
                                 nfs_input::MenuNav::Right => MenuKey::Right,
-                                nfs_input::MenuNav::Select => MenuKey::Enter,
+                                nfs_input::MenuNav::Select if focus_mode => MenuKey::Enter,
+                                nfs_input::MenuNav::Select => continue,
                                 // B: the question's "no" / the menu's "continue" (PAD-END2, D10)
                                 nfs_input::MenuNav::Back => MenuKey::Back,
-                                nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux => continue,
+                                nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux | nfs_input::MenuNav::Start | nfs_input::MenuNav::L1 | nfs_input::MenuNav::R1 => continue,
                             };
                             self.pause_menu_key(key, event_loop);
                             if !self.paused || self.vehicle.is_none() {
@@ -1078,23 +1086,32 @@ impl App {
         let wheel: Vec<char> = if digits { "0123456789".chars().collect() } else { NAME_WHEEL.chars().collect() };
         let keys = self.input.pad_menu.clone();
         let mut sound = None;
+        // gptokeyb2's `text_input` layout: up / down the letter, right or A adds one, left or B takes
+        // one off, L1 / R1 ten letters, Start finishes (the dialog's Enter)
         for k in keys {
             let text = d.field.as_ref().map(|f| f.text.clone()).unwrap_or_default();
-            match k {
-                nfs_input::MenuNav::Up | nfs_input::MenuNav::Down => {
-                    let step = if k == nfs_input::MenuNav::Up { wheel.len() - 1 } else { 1 };
-                    match text.chars().last() {
-                        None => sound = d.type_char(wheel[0]).or(sound),
-                        Some(c) => {
-                            let i = wheel.iter().position(|w| *w == c.to_ascii_uppercase()).unwrap_or(0);
-                            d.backspace();
-                            sound = d.type_char(wheel[(i + step) % wheel.len()]).or(sound);
-                        }
+            let turn = match k {
+                nfs_input::MenuNav::Up => Some(wheel.len() - 1),
+                nfs_input::MenuNav::Down => Some(1),
+                nfs_input::MenuNav::L1 => Some(wheel.len() - 10 % wheel.len()),
+                nfs_input::MenuNav::R1 => Some(10 % wheel.len()),
+                _ => None,
+            };
+            if let Some(step) = turn {
+                match text.chars().last() {
+                    None => sound = d.type_char(wheel[0]).or(sound),
+                    Some(c) => {
+                        let i = wheel.iter().position(|w| *w == c.to_ascii_uppercase()).unwrap_or(0);
+                        d.backspace();
+                        sound = d.type_char(wheel[(i + step) % wheel.len()]).or(sound);
                     }
                 }
-                nfs_input::MenuNav::Right => sound = d.type_char(wheel[0]).or(sound),
-                nfs_input::MenuNav::Left => sound = d.backspace().or(sound),
-                nfs_input::MenuNav::Select => sound = d.enter().or(sound),
+                continue;
+            }
+            match k {
+                nfs_input::MenuNav::Right | nfs_input::MenuNav::Select => sound = d.type_char(wheel[0]).or(sound),
+                nfs_input::MenuNav::Left | nfs_input::MenuNav::Back => sound = d.backspace().or(sound),
+                nfs_input::MenuNav::Start => sound = d.enter().or(sound),
                 _ => {}
             }
         }

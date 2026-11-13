@@ -932,6 +932,12 @@ pub fn menu_button(b: SDL_GameControllerButton, face: &[SDL_GameControllerButton
         Alt
     } else if b == face[3] {
         Aux
+    } else if b == SDL_CONTROLLER_BUTTON_START {
+        Start
+    } else if b == SDL_CONTROLLER_BUTTON_LEFTSHOULDER {
+        L1
+    } else if b == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER {
+        R1
     } else {
         return None;
     })
