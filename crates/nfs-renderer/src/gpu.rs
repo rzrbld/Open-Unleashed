@@ -1045,6 +1045,13 @@ impl Core {
                 Cmd::DynamicMesh(m) => {
                     self.upload_dynamic_mesh(&m);
                 }
+                Cmd::UploadMesh(m) => {
+                    self.upload_mesh(&m);
+                }
+                Cmd::UploadTextures(items) => {
+                    let refs: Vec<(u32, u32, &[Vec<u8>])> = items.iter().map(|(w, h, m)| (*w, *h, m.as_slice())).collect();
+                    self.upload_textures(&refs);
+                }
                 Cmd::Offscreen(j) => {
                     let id = self.render_offscreen(&j.scene, &j.camera, OffscreenSpec { width: j.width, height: j.height, reuse: j.reuse, clear_colour: j.clear, depth_far: j.depth_far });
                     debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");

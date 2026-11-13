@@ -45,6 +45,9 @@ pub(crate) enum Cmd {
     DuplicateMaterial { id: MaterialId, texture: TextureId },
     DynamicMesh(Box<MeshData>),
     Offscreen(Box<OffscreenJob>),
+    /// ReNFS5: a static mesh / textures uploaded on the render thread (ids handed out by the front)
+    UploadMesh(Box<MeshData>),
+    UploadTextures(Vec<(u32, u32, Vec<Vec<u8>>)>),
 }
 
 pub(crate) struct OffscreenJob {
@@ -75,6 +78,9 @@ struct Job {
     list: CmdList,
     scene: Scene,
     camera: Camera,
+    /// ReNFS5: `Some((w, h, still))`: an image of the scene (`render_to_image` / `render_still`)
+    /// instead of a frame
+    image: Option<(u32, u32, bool)>,
 }
 
 struct Done {
@@ -84,6 +90,7 @@ struct Done {
     result: Result<()>,
     /// the lens-flare read-backs the core had finished by the end of the frame
     lens: Vec<LensRead>,
+    image: Option<Result<(u32, u32, Vec<u8>)>>,
 }
 
 /// The render thread: owns the core while a frame is in flight.
@@ -121,6 +128,8 @@ pub struct Renderer {
     offscreen: HashMap<u32, (u32, u32)>,
     /// the last [`Self::set_gamma`] value, so an unchanged one records nothing
     gamma: f32,
+    /// ReNFS5: the image the render thread drew for `image_on_thread`
+    image_done: Option<Result<(u32, u32, Vec<u8>)>>,
 }
 
 impl Renderer {
@@ -143,6 +152,7 @@ impl Renderer {
             spare_scene: None,
             pending_err: None,
             lens_done: Vec::new(),
+            image_done: None,
         })
     }
 
@@ -157,20 +167,32 @@ impl Renderer {
         let handle = std::thread::Builder::new()
             .name("nfs-render".into())
             .spawn(move || {
-                while let Ok(Job { mut core, mut list, scene, camera }) = jobs.recv() {
-                    // ReNFS5: a GL context is current on one thread at a time — this one while it draws
-                    core.gl_current(true);
+                // ReNFS5: the GL context lives on this thread from here on (made current once, as
+                // d3es's backend thread does): the game thread never touches GL again — a context
+                // handed over every frame costs two `MakeCurrent`s a frame, dear on Mali
+                let mut current = false;
+                while let Ok(Job { mut core, mut list, scene, camera, image }) = jobs.recv() {
+                    if !current {
+                        core.gl_current(true);
+                        current = true;
+                    }
                     core.frame_begin();
                     core.apply(&mut list);
-                    let result = core.render(&scene, &camera);
+                    let (result, image) = match image {
+                        None => (core.render(&scene, &camera), None),
+                        Some((w, h, still)) => (Ok(()), Some(if still { core.render_still(&scene, &camera, w, h) } else { core.render_to_image(&scene, &camera, w, h).map(|px| (w, h, px)) })),
+                    };
                     let lens = core.take_lens();
-                    core.gl_current(false);
-                    if done_tx.send(Done { core, list, scene, result, lens }).is_err() {
+                    if done_tx.send(Done { core, list, scene, result, lens, image }).is_err() {
                         break;
                     }
                 }
             })
             .expect("render thread");
+        // the context leaves this thread for good
+        if let Some(core) = self.core.as_ref() {
+            core.gl_current(false);
+        }
         self.worker = Some(Worker { tx: Some(tx), rx, handle: Some(handle), in_flight: false });
     }
 
@@ -183,13 +205,15 @@ impl Renderer {
         let Some(w) = self.worker.as_mut().filter(|w| w.in_flight) else { return };
         let d = w.rx.recv().expect("render thread died");
         w.in_flight = false;
-        d.core.gl_current(true);
         self.core = Some(d.core);
         self.spare_list = Some(d.list);
         self.spare_scene = Some(d.scene);
         self.lens_done.extend(d.lens);
         if let Err(e) = d.result {
             self.pending_err = Some(e);
+        }
+        if d.image.is_some() {
+            self.image_done = d.image;
         }
     }
 
@@ -217,17 +241,28 @@ impl Renderer {
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
+        self.send_job(scene, camera, None);
+        Ok(())
+    }
+
+    /// Hand the core, the recorded commands and a copy of `scene` to the render thread.
+    fn send_job(&mut self, scene: &Scene, camera: &Camera, image: Option<(u32, u32, bool)>) {
         let core = self.core.take().expect("core home");
-        // ReNFS5: let the GL context go, for the render thread to take it
-        core.gl_current(false);
         let list = std::mem::replace(&mut self.list, self.spare_list.take().unwrap_or_default());
         self.list.barrier = 0;
         let mut copy = self.spare_scene.take().unwrap_or_default();
         scene.copy_into(&mut copy);
         let w = self.worker.as_mut().expect("worker");
         w.in_flight = true;
-        w.tx.as_ref().expect("sender").send(Job { core, list, scene: copy, camera: *camera }).expect("render thread died");
-        Ok(())
+        w.tx.as_ref().expect("sender").send(Job { core, list, scene: copy, camera: *camera, image }).expect("render thread died");
+    }
+
+    /// An image of the scene drawn on the render thread, waited for.
+    fn image_on_thread(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, still: bool) -> Result<(u32, u32, Vec<u8>)> {
+        self.wait_home();
+        self.send_job(scene, camera, Some((width, height, still)));
+        self.wait_home();
+        self.image_done.take().unwrap_or_else(|| Err(anyhow::anyhow!("render thread drew no image")))
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -296,6 +331,12 @@ impl Renderer {
     }
 
     pub fn upload_mesh(&mut self, mesh: &MeshData) -> MeshId {
+        if self.worker.is_some() {
+            // ReNFS5: uploaded on the render thread with the next frame's commands
+            self.meshes.push(MeshMirror { vertex_len: std::mem::size_of_val(mesh.vertices.as_slice()) as u64, writes: 0 });
+            self.list.cmds.push(Cmd::UploadMesh(Box::new(mesh.clone())));
+            return MeshId(self.meshes.len() as u32 - 1);
+        }
         let core = self.home();
         let id = core.upload_mesh(mesh);
         let vertex_len = core.mesh_vertex_len(id);
@@ -311,6 +352,9 @@ impl Renderer {
     /// [`Self::upload_texture`] over borrowed levels, so a caller that keeps its pixels does not
     /// clone a whole mip chain just to hand it over.
     pub fn upload_texture_mips(&mut self, width: u32, height: u32, mips: &[Vec<u8>]) -> TextureId {
+        if self.worker.is_some() {
+            return self.upload_textures(&[(width, height, mips)])[0];
+        }
         let core = self.home();
         let id = core.upload_texture_mips(width, height, mips);
         self.n_textures = core.texture_count();
@@ -320,6 +364,13 @@ impl Renderer {
     /// Several textures at once, the ids in the order given (the next free ones, as the same number
     /// of [`Self::upload_texture_mips`] calls would hand them).
     pub fn upload_textures(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
+        if self.worker.is_some() {
+            // ReNFS5: uploaded on the render thread with the next frame's commands
+            let first = self.n_textures;
+            self.n_textures += items.len() as u32;
+            self.list.cmds.push(Cmd::UploadTextures(items.iter().map(|&(w, h, m)| (w, h, m.to_vec())).collect()));
+            return (first..self.n_textures).map(TextureId).collect();
+        }
         let core = self.home();
         let ids = core.upload_textures(items);
         self.n_textures = core.texture_count();
@@ -478,12 +529,18 @@ impl Renderer {
     }
 
     pub fn render_to_image(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {
+        if self.worker.is_some() {
+            return self.image_on_thread(scene, camera, width, height, false).map(|(_, _, px)| px);
+        }
         self.home().render_to_image(scene, camera, width, height)
     }
 
     /// PORT-DEVIATION D46 (photo mode): a still of the scene (`Core::render_still`) at about `width x height`, the
     /// size it really got and RGBA8 rows.
     pub fn render_still(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<(u32, u32, Vec<u8>)> {
+        if self.worker.is_some() {
+            return self.image_on_thread(scene, camera, width, height, true);
+        }
         self.home().render_still(scene, camera, width, height)
     }
 
