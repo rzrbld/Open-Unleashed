@@ -50,6 +50,9 @@ pub(crate) fn open(window: &Arc<Window>) -> Result<Opened> {
 }
 
 fn open_vulkan(window: &Arc<Window>) -> Result<Opened> {
+    // the Vulkan driver SDL2 resolved for the window (PortMaster: graphics only through SDL2)
+    let gipa = window.vulkan_instance_proc_addr().context("SDL2 has no Vulkan library loaded")?;
+    wgpu::hal::vulkan::set_instance_proc_addr(gipa);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN,
         flags: wgpu::InstanceFlags::from_build_config().with_env(),

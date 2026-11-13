@@ -451,6 +451,13 @@ impl Window {
     }
 
     /// The window's `VkSurfaceKHR` on `instance` (a `VkInstance` handle).
+    /// `vkGetInstanceProcAddr` of the Vulkan library SDL2 loaded for this (Vulkan) window.
+    pub fn vulkan_instance_proc_addr(&self) -> Option<usize> {
+        // SAFETY: a plain query; null when SDL2 has no Vulkan library loaded
+        let f = unsafe { sys::SDL_Vulkan_GetVkGetInstanceProcAddr() };
+        (!f.is_null()).then_some(f as usize)
+    }
+
     pub unsafe fn vulkan_create_surface(&self, instance: u64) -> Result<u64, OsError> {
         let mut surface: sys::VkSurfaceKHR = 0;
         // SAFETY: the caller's live instance, made with `vulkan_instance_extensions`

@@ -199,6 +199,15 @@ pub fn set_external_surface(raw: u64) {
     *EXTERNAL_SURFACE.lock() = Some(raw);
 }
 
+/// ReNFS5: `vkGetInstanceProcAddr` from the windowing library (SDL2's `SDL_Vulkan_LoadLibrary`), so
+/// the Vulkan driver is the one SDL2 resolved instead of a second `dlopen("libvulkan.so.1")`.
+static EXTERNAL_GIPA: parking_lot::Mutex<Option<usize>> = parking_lot::Mutex::new(None);
+
+/// ReNFS5: make every later instance load its entry points through this `vkGetInstanceProcAddr`.
+pub fn set_instance_proc_addr(f: usize) {
+    *EXTERNAL_GIPA.lock() = Some(f);
+}
+
 impl super::Instance {
     pub fn shared_instance(&self) -> &super::InstanceShared {
         &self.shared
@@ -591,7 +600,13 @@ impl super::Instance {
             #[cfg(target_env = "ohos")]
             let loaded = ash::Entry::load_from("libvulkan.so");
             #[cfg(not(target_env = "ohos"))]
-            let loaded = ash::Entry::load();
+            let loaded = match *EXTERNAL_GIPA.lock() {
+                // SAFETY: a live `vkGetInstanceProcAddr` the windowing library loaded
+                Some(f) => Ok(ash::Entry::from_static_fn(ash::StaticFn {
+                    get_instance_proc_addr: core::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(f),
+                })),
+                None => ash::Entry::load(),
+            };
             loaded
         }
         .map_err(|err| {
