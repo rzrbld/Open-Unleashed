@@ -9,10 +9,11 @@ struct State {
     last: Option<Instant>,
     marks: Vec<(&'static str, f32)>,
     note: String,
+    counts: Vec<(&'static str, u32)>,
 }
 
 thread_local! {
-    static S: RefCell<State> = const { RefCell::new(State { start: None, last: None, marks: Vec::new(), note: String::new() }) };
+    static S: RefCell<State> = const { RefCell::new(State { start: None, last: None, marks: Vec::new(), note: String::new(), counts: Vec::new() }) };
 }
 
 fn on() -> bool {
@@ -50,6 +51,20 @@ pub fn note(text: &str) {
     });
 }
 
+/// One more of `name` this frame (shown as `name=n` in the frame's line).
+pub fn count(name: &'static str) {
+    if !on() {
+        return;
+    }
+    S.with(|s| {
+        let mut s = s.borrow_mut();
+        match s.counts.iter_mut().find(|c| c.0 == name) {
+            Some(c) => c.1 += 1,
+            None => s.counts.push((name, 1)),
+        }
+    });
+}
+
 /// The frame starts: the time since the last frame's end is `wait`; a slow previous frame is logged.
 pub fn frame_start() {
     if !on() {
@@ -78,11 +93,17 @@ pub fn frame_start() {
                     }
                 }
                 let parts: Vec<String> = sums.iter().filter(|e| e.1 >= 0.5).map(|(n, ms, c)| if *c > 1 { format!("{n}={ms:.1}x{c}") } else { format!("{n}={ms:.1}") }).collect();
-                tracing::info!(total_ms = format!("{total:.1}"), phases = parts.join(" "), note = %s.note, "hitch");
+                let thread = std::thread::current().name().unwrap_or("?").to_string();
+                for (n, c) in std::mem::take(&mut s.counts) {
+                    let t = format!(" {n}={c}");
+                    s.note.push_str(&t);
+                }
+                tracing::info!(thread, total_ms = format!("{total:.1}"), phases = parts.join(" "), note = %s.note, "hitch");
             }
         }
         s.marks.clear();
         s.note.clear();
+        s.counts.clear();
         s.start = Some(now);
         s.last = Some(now);
     });

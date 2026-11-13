@@ -1031,6 +1031,8 @@ impl Core {
                 Cmd::Projector(t) => self.set_projector_texture(t),
                 Cmd::HeadlightTexture(t) => self.set_headlight_texture(t),
                 Cmd::MirrorView(on) => self.set_mirror_view(on),
+                // wgpu writes through `queue.write_buffer`, which never waits: nothing to prepare
+                Cmd::PrepareWrites(_) => {}
                 Cmd::Trilinear(on) => self.set_trilinear(on),
                 Cmd::FakeSort(m) => self.set_fakesort_mode(m),
                 Cmd::Gamma(g) => self.set_gamma(g),

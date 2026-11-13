@@ -607,6 +607,7 @@ impl GlCore {
                 Cmd::UploadTextures(_) => "c_uploadtex",
                 Cmd::Offscreen(_) => "c_offscreen",
                 Cmd::CreateMaterial(_) | Cmd::DuplicateMaterial { .. } => "c_material",
+                Cmd::PrepareWrites(_) => "c_prepare",
                 _ => "c_state",
             };
             crate::hitch::mark("c_gap");
@@ -617,6 +618,13 @@ impl GlCore {
                 Cmd::Projector(t) => self.proj_tex = t,
                 Cmd::HeadlightTexture(t) => self.head_tex = t,
                 Cmd::MirrorView(on) => self.no_reflections = on,
+                Cmd::PrepareWrites(ids) => {
+                    for id in ids {
+                        if self.meshes.get(id as usize).is_some_and(|m| m.dynamic_size.is_none() && m.local_indices.is_some()) && !env_off("NFS5_PROMOTE") {
+                            self.promote_mesh(id);
+                        }
+                    }
+                }
                 Cmd::Trilinear(on) => self.trilinear = on,
                 Cmd::FakeSort(m) => self.fakesort_mode = m,
                 Cmd::Gamma(g) => self.gamma = if g <= 0.0 { 0.0 } else if g < 4.0 { g } else { 4.0 },
@@ -643,12 +651,15 @@ impl GlCore {
                     self.upload_textures(&refs);
                 }
                 Cmd::Offscreen(j) => {
+                    self.stream_flush();
                     let id = self.render_offscreen(&j.scene, &j.camera, OffscreenSpec { width: j.width, height: j.height, reuse: j.reuse, clear_colour: j.clear, depth_far: j.depth_far });
                     debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
                 }
             }
             crate::hitch::mark(kind);
         }
+        self.stream_flush();
+        crate::hitch::mark("c_flush");
         bytes.clear();
     }
 
@@ -760,6 +771,16 @@ impl GlCore {
         }
         let m = &mut self.meshes[id as usize];
         m.writes = m.writes.wrapping_add(1);
+        // the same vertices again (a crash re-sends every part of both cars, most of them unchanged):
+        // nothing to upload — the mesh still has them, in its own buffer or in a live stream third
+        if let Some(sh) = m.shadow.as_ref()
+            && bytes.len() <= sh.len()
+            && sh[..bytes.len()] == *bytes
+            && !env_off("NFS5_WRITE_SKIP")
+        {
+            crate::hitch::count("skip");
+            return;
+        }
         match m.shadow.as_mut() {
             Some(shadow) => {
                 let n = bytes.len().min(shadow.len());
@@ -814,7 +835,7 @@ impl GlCore {
                 self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 self.gl.buffer_data_size(glow::ARRAY_BUFFER, (STREAM_SEG_SIZE * STREAM_SEGS as u64) as i32, glow::STREAM_DRAW);
                 self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-                self.stream = Some(StreamRing { vbo, seg_size: STREAM_SEG_SIZE, seg: 0, cursor: 0, fences: [None, None, None], residents: Default::default() });
+                self.stream = Some(StreamRing { vbo, seg_size: STREAM_SEG_SIZE, seg: 0, cursor: 0, fences: [None, None, None], residents: Default::default(), pending: Vec::new() });
             }
         }
         let r = self.stream.as_mut().expect("stream");
@@ -830,26 +851,54 @@ impl GlCore {
         let seg = r.seg;
         r.residents[seg].push(id);
         let vbo = r.vbo;
+        r.pending.push((id, at, len));
         self.meshes[id as usize].stream_seg = Some(seg);
-        let m = &self.meshes[id as usize];
-        let shadow = m.shadow.as_ref().expect("shadow");
-        // SAFETY: a range of the stream no draw in flight reads (its third's fence has passed);
-        // mapped, filled and unmapped before any draw
+        let vao = self.meshes[id as usize].vao;
+        // SAFETY: the VAO is pointed at the reserved range; `stream_flush` fills it before any draw
+        unsafe {
+            self.gl.bind_vertex_array(None);
+            self.st.vao = None;
+            Self::point_vao(&self.gl, vao, vbo, at);
+        }
+        true
+    }
+
+    /// The writes reserved since the last flush, copied into the stream under one map — before any
+    /// draw reads them (a map per mesh cost 0.09 ms each: 34 ms for a crash's 368 parts).
+    fn stream_flush(&mut self) {
+        let Some(r) = self.stream.as_mut() else { return };
+        if r.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut r.pending);
+        let vbo = r.vbo;
+        let lo = pending.iter().map(|p| p.1).min().unwrap_or(0);
+        let hi = pending.iter().map(|p| p.1 + p.2).max().unwrap_or(0);
+        // SAFETY: a range of the stream's current third, which no draw in flight reads (its fence
+        // has passed); written whole and unmapped before the draws
         unsafe {
             self.gl.bind_vertex_array(None);
             self.st.vao = None;
             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            let p = self.gl.map_buffer_range(glow::ARRAY_BUFFER, at as i32, len as i32, glow::MAP_WRITE_BIT | glow::MAP_UNSYNCHRONIZED_BIT | glow::MAP_INVALIDATE_RANGE_BIT);
-            if p.is_null() {
-                self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-                return false;
+            let p = self.gl.map_buffer_range(glow::ARRAY_BUFFER, lo as i32, (hi - lo) as i32, glow::MAP_WRITE_BIT | glow::MAP_UNSYNCHRONIZED_BIT | glow::MAP_INVALIDATE_RANGE_BIT);
+            if !p.is_null() {
+                for (id, at, len) in &pending {
+                    if let Some(sh) = self.meshes.get(*id as usize).and_then(|m| m.shadow.as_ref()) {
+                        let n = (*len as usize).min(sh.len());
+                        std::ptr::copy_nonoverlapping(sh.as_ptr(), p.add((at - lo) as usize), n);
+                    }
+                }
+                self.gl.unmap_buffer(glow::ARRAY_BUFFER);
+            } else {
+                // no mapping: the same bytes by plain uploads (the range is not in use)
+                for (id, at, _) in &pending {
+                    if let Some(sh) = self.meshes.get(*id as usize).and_then(|m| m.shadow.as_ref()) {
+                        self.gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, *at as i32, sh);
+                    }
+                }
             }
-            std::ptr::copy_nonoverlapping(shadow.as_ptr(), p, len as usize);
-            self.gl.unmap_buffer(glow::ARRAY_BUFFER);
             self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            Self::point_vao(&self.gl, m.vao, vbo, at);
         }
-        true
     }
 
     /// Point a mesh VAO's four attributes at `buffer` from byte `base` (its element buffer stays).
@@ -872,6 +921,7 @@ impl GlCore {
     fn promote_mesh(&mut self, id: u32) {
         let Some(m) = self.meshes.get_mut(id as usize) else { return };
         let Some(local) = m.local_indices.take() else { return };
+        crate::hitch::count("promote");
         let (vlen, voff, avbo) = (m.vertex_len, m.vertex_offset, m.vbo);
         // SAFETY: GL buffer work on the current context: a copy inside the GPU, then new objects
         unsafe {
@@ -1446,6 +1496,7 @@ impl GlCore {
     /// sprites (`gpu.rs`'s `encode_frame`).
     #[allow(clippy::too_many_arguments)]
     fn draw_frame(&mut self, scene: &Scene, camera: &Camera, tgt: Tgt, clear_colour: [f64; 4], with_sprites: bool, aspect: f32, depth_far: f32, probe: Option<LensProbe>) {
+        self.stream_flush();
         self.pass += 1;
         let n = scene.items.len().min(MAX_OBJECTS);
         let mut buckets = std::mem::take(&mut self.buckets);
@@ -1794,6 +1845,9 @@ struct StreamRing {
     fences: [Option<glow::Fence>; STREAM_SEGS],
     /// the meshes whose vertices each third holds (a later write elsewhere moves them)
     residents: [Vec<u32>; STREAM_SEGS],
+    /// writes reserved this frame and not yet copied: (mesh, offset, length) — one map for all of
+    /// them before the next draw (`stream_flush`)
+    pending: Vec<(u32, u64, u64)>,
 }
 
 /// `NAME=0` in the environment (test switches).

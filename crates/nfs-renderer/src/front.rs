@@ -28,6 +28,9 @@ use winit::window::Window;
 
 /// One recorded mutation. Byte payloads live in [`CmdList::bytes`].
 pub(crate) enum Cmd {
+    /// ReNFS5: meshes that will be rewritten (a car's crushable parts) moved to their own buffers
+    /// now, at load, instead of on their first write mid-race
+    PrepareWrites(Vec<u32>),
     /// `bytes[start..start + len]` into mesh `mesh`'s vertex range (validated on the front)
     WriteMesh { mesh: u32, start: usize, len: usize },
     /// one mip level of a texture, `height` tight rows of `4 · width` bytes at `bytes[start..]`
@@ -172,6 +175,7 @@ impl Renderer {
                 // handed over every frame costs two `MakeCurrent`s a frame, dear on Mali
                 let mut current = false;
                 while let Ok(Job { mut core, mut list, scene, camera, image }) = jobs.recv() {
+                    crate::hitch::frame_start();
                     if !current {
                         core.gl_current(true);
                         current = true;
@@ -240,6 +244,7 @@ impl Renderer {
             return core.render(scene, camera);
         }
         self.wait_home();
+        crate::hitch::mark("rt_wait");
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
@@ -318,6 +323,14 @@ impl Renderer {
 
     /// New vertices for a mesh already uploaded, the same count — the morphing parts of a car
     /// (its roof) rewrite theirs when the animation moves.
+    /// ReNFS5: these meshes will be rewritten (a car's crushable parts): give them buffers of their
+    /// own now — at load — so the first crash does not move a few hundred at once (a 30–60 ms frame).
+    pub fn prepare_mesh_writes(&mut self, ids: &[MeshId]) {
+        if !ids.is_empty() {
+            self.list.cmds.push(Cmd::PrepareWrites(ids.iter().map(|m| m.0).collect()));
+        }
+    }
+
     pub fn update_mesh_vertices(&mut self, id: MeshId, vertices: &[Vertex]) {
         if let Some(m) = self.meshes.get(id.0 as usize)
             && std::mem::size_of_val(vertices) as u64 == m.vertex_len

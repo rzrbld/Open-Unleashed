@@ -1335,6 +1335,8 @@ impl CarModel {
         tracing::info!(unlisted, "car part order");
         tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), roof_parts = morph[1].len(), roof_length = anim_length[1], anims = ?anim_length, skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
         tracing::info!(patches = damage_patches.len(), night, "damage decals");
+        // ReNFS5: the crushable parts get buffers of their own now, not at the first crash
+        r.prepare_mesh_writes(&deform.iter().map(|p| p.mesh).collect::<Vec<_>>());
         Ok(Self {
             scale: 1.0,
             mirror: false,
@@ -1418,6 +1420,7 @@ impl CarModel {
         for p in &mut c.deform {
             p.mesh = r.upload_mesh(&MeshData { vertices: p.base.clone(), indices: p.indices.clone() });
         }
+        r.prepare_mesh_writes(&c.deform.iter().map(|p| p.mesh).collect::<Vec<_>>());
         // the decal pages any zone can touch: a fresh texture (pristine pixels) plus a fresh
         // material for every existing material that samples it, so its bind group is not shared
         // with the template's or another instance's
