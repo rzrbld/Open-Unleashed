@@ -233,7 +233,9 @@ impl Renderer {
         if self.worker.is_none() {
             let core = self.core.as_mut().expect("core home");
             core.frame_begin();
+            crate::hitch::mark("begin");
             core.apply(&mut self.list);
+            crate::hitch::mark("apply");
             self.list.barrier = 0;
             return core.render(scene, camera);
         }

@@ -27,7 +27,9 @@ impl App {
         self.fe_ms_carry = carry;
         self.fe.ms += dt_ms as u64;
         self.fe_frame_tick(dt_ms);
+        nfs_renderer::hitch::mark("pre_scene");
         self.rebuild_scene();
+        nfs_renderer::hitch::mark("scene");
         self.update_damage_decals();
         // the mip filter's promotion `[0x69DD1D]`: the race's 0x44ED10 sets it at `SPECIALFX` 3
         // only (0x44EDD1 clears, 0x44EF04 sets), the front end's 0x44F020 clears it (0x44F080)
@@ -71,6 +73,7 @@ impl App {
                 }
             });
         }
+        nfs_renderer::hitch::mark("prep");
         if !idle
             && let Some(r) = self.renderer.as_mut()
             && let Err(e) = r.render(&self.scene, &self.camera)

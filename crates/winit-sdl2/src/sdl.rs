@@ -322,6 +322,15 @@ impl Window {
         Some(MonitorHandle { display: d.max(0) })
     }
 
+    /// ReNFS5: the refresh rate of the display mode the window is shown in, in Hz (`None` when SDL2
+    /// does not know it).
+    pub fn refresh_hz(&self) -> Option<f64> {
+        // SAFETY: a live window, a plain struct filled in
+        let mut m: sys::SDL_DisplayMode = unsafe { std::mem::zeroed() };
+        let ok = unsafe { sys::SDL_GetWindowDisplayMode(self.raw(), &mut m) } == 0;
+        (ok && m.refresh_rate > 0).then_some(m.refresh_rate as f64)
+    }
+
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
         Some(MonitorHandle { display: 0 })
     }

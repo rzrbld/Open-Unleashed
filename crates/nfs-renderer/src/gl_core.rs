@@ -52,6 +52,9 @@ struct GlMesh {
     /// the size the dynamic mesh's buffer was made with (re-specified at that size per write)
     dynamic_size: Option<u64>,
     writes: u32,
+    /// ReNFS5: an arena mesh's vertices once it is rewritten — it then has buffers of its own,
+    /// re-specified whole per write (`write_mesh`)
+    shadow: Option<Vec<u8>>,
 }
 
 struct Arena {
@@ -230,6 +233,13 @@ pub(crate) struct GlCore {
     gamma: f32,
     lens_enabled: bool,
     lens_done: Vec<LensRead>,
+    /// ReNFS5: the window frame's lens reads in flight — read into a pixel-pack buffer behind a
+    /// fence and collected when the GPU is done, so the CPU never waits on the GPU mid-frame (a
+    /// synchronous `glReadPixels` cost 50–70 ms frames on Mali with the sun in view)
+    lens_pending: Vec<LensPending>,
+    lens_pbos: Vec<glow::Buffer>,
+    /// the window frame (`render`) reads asynchronously; stills and images keep the direct read
+    lens_async: bool,
     offscreen: HashMap<u32, (u32, u32)>,
     offscreen_fbos: HashMap<u32, Offscreen>,
     depth_rbs: HashMap<(u32, u32), glow::Renderbuffer>,
@@ -404,6 +414,9 @@ impl GlCore {
                 gamma: 1.0,
                 lens_enabled: false,
                 lens_done: Vec::new(),
+                lens_pending: Vec::new(),
+                lens_pbos: Vec::new(),
+                lens_async: false,
                 offscreen: HashMap::new(),
                 offscreen_fbos: HashMap::new(),
                 depth_rbs: HashMap::new(),
@@ -449,7 +462,37 @@ impl GlCore {
         self.size
     }
     pub(crate) fn take_lens(&mut self) -> Vec<LensRead> {
+        self.lens_poll(false);
         std::mem::take(&mut self.lens_done)
+    }
+
+    /// ReNFS5: move the finished asynchronous lens reads into `lens_done`, in order. `force` (or a
+    /// read three frames old) waits for the GPU instead of leaving it for later.
+    fn lens_poll(&mut self, force: bool) {
+        while let Some(p) = self.lens_pending.first() {
+            let wait = force || self.pass.wrapping_sub(p.pass) > 6;
+            // SAFETY: a fence this context made
+            let st = unsafe { self.gl.client_wait_sync(p.fence, if wait { glow::SYNC_FLUSH_COMMANDS_BIT } else { 0 }, if wait { 100_000_000 } else { 0 }) };
+            if st != glow::ALREADY_SIGNALED && st != glow::CONDITION_SATISFIED && !wait {
+                break;
+            }
+            let p = self.lens_pending.remove(0);
+            let mut block = [0u8; 64];
+            // SAFETY: the buffer the read went into, 64 bytes, mapped for reading and unmapped
+            unsafe {
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(p.pbo));
+                let ptr = self.gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, 64, glow::MAP_READ_BIT);
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(ptr, block.as_mut_ptr(), 64);
+                    self.gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                }
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                self.gl.delete_sync(p.fence);
+            }
+            self.lens_pbos.push(p.pbo);
+            let pixels = lens_block_pixels(&block, p.flip);
+            self.lens_done.push(LensRead { reference: p.reference, pixels, cost_ms: 0 });
+        }
     }
     pub(crate) fn gl_current(&self, current: bool) {
         self.window.gl_make_current(current);
@@ -459,6 +502,17 @@ impl GlCore {
     pub(crate) fn apply(&mut self, list: &mut CmdList) {
         let CmdList { cmds, bytes, .. } = list;
         for c in cmds.drain(..) {
+            let kind: &'static str = match &c {
+                Cmd::WriteMesh { .. } => "c_writemesh",
+                Cmd::UpdateTextureLevel { .. } => "c_texlevel",
+                Cmd::DynamicMesh(_) => "c_dynmesh",
+                Cmd::UploadMesh(_) => "c_uploadmesh",
+                Cmd::UploadTextures(_) => "c_uploadtex",
+                Cmd::Offscreen(_) => "c_offscreen",
+                Cmd::CreateMaterial(_) | Cmd::DuplicateMaterial { .. } => "c_material",
+                _ => "c_state",
+            };
+            crate::hitch::mark("c_gap");
             match c {
                 Cmd::WriteMesh { mesh, start, len } => self.write_mesh(mesh, &bytes[start..start + len]),
                 Cmd::UpdateTextureLevel { texture, level, width, height, start, len } => self.update_texture_level(texture, level, width, height, &bytes[start..start + len]),
@@ -496,6 +550,7 @@ impl GlCore {
                     debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
                 }
             }
+            crate::hitch::mark(kind);
         }
         bytes.clear();
     }
@@ -556,7 +611,7 @@ impl GlCore {
                 self.gl.buffer_sub_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, a.iused as i32, bytemuck::cast_slice(&indices));
             }
             self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            self.meshes.push(GlMesh { vao: a.vao, vbo: a.vbo, index_offset: a.iused, index_count: mesh.indices.len() as u32, vertex_offset: a.vused, vertex_len: vlen, dynamic_size: None, writes: 0 });
+            self.meshes.push(GlMesh { vao: a.vao, vbo: a.vbo, index_offset: a.iused, index_count: mesh.indices.len() as u32, vertex_offset: a.vused, vertex_len: vlen, dynamic_size: None, writes: 0, shadow: None });
             a.vused += vreserve;
             a.iused += ireserve;
         }
@@ -582,21 +637,34 @@ impl GlCore {
             let ib: &[u8] = bytemuck::cast_slice(&mesh.indices);
             self.gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, if ib.is_empty() { &[0; 4] } else { ib }, glow::STATIC_DRAW);
             let vao = self.make_vao(vbo, ibo);
-            self.meshes.push(GlMesh { vao, vbo, index_offset: 0, index_count: mesh.indices.len() as u32, vertex_offset: 0, vertex_len: vlen, dynamic_size: Some(vlen), writes: 0 });
+            self.meshes.push(GlMesh { vao, vbo, index_offset: 0, index_count: mesh.indices.len() as u32, vertex_offset: 0, vertex_len: vlen, dynamic_size: Some(vlen), writes: 0, shadow: None });
         }
         MeshId(self.meshes.len() as u32 - 1)
     }
 
     fn write_mesh(&mut self, id: u32, bytes: &[u8]) {
-        let Some(m) = self.meshes.get_mut(id as usize) else { return };
+        let Some(m) = self.meshes.get(id as usize) else { return };
         if bytes.is_empty() {
             return;
         }
+        // ReNFS5: a write into the shared arena makes the Mali driver wait for (or copy) the whole
+        // arena while the GPU still draws from it — 44 writes a frame cost 50 ms frames in the Alps.
+        // The mesh moves to buffers of its own on its first write instead.
+        if m.dynamic_size.is_none() && m.shadow.is_none() {
+            self.promote_mesh(id);
+        }
+        let m = &mut self.meshes[id as usize];
         m.writes = m.writes.wrapping_add(1);
         // SAFETY: GL buffer work on the current context
         unsafe {
             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(m.vbo));
-            if let Some(size) = m.dynamic_size {
+            if let Some(shadow) = m.shadow.as_mut() {
+                // the written prefix over the kept vertices, the whole buffer re-specified: the
+                // driver gives the GPU's copy its own storage instead of waiting
+                let n = bytes.len().min(shadow.len());
+                shadow[..n].copy_from_slice(&bytes[..n]);
+                self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, shadow, glow::STREAM_DRAW);
+            } else if let Some(size) = m.dynamic_size {
                 // a fresh allocation for this frame's vertices: the buffer the last frames drew
                 // from is left to the GPU
                 self.gl.buffer_data_size(glow::ARRAY_BUFFER, size as i32, glow::STREAM_DRAW);
@@ -605,6 +673,63 @@ impl GlCore {
                 self.gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, m.vertex_offset as i32, bytes);
             }
             self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
+    }
+
+    /// ReNFS5: give arena mesh `id` a vertex buffer, an index buffer and a VAO of its own, its
+    /// vertices kept on the CPU (`GlMesh::shadow`). Reads the arena back once (one wait, on the
+    /// mesh's first write); without that read it stays in the arena.
+    fn promote_mesh(&mut self, id: u32) {
+        let Some(m) = self.meshes.get(id as usize) else { return };
+        let (vlen, ioff, icount, voff) = (m.vertex_len as usize, m.index_offset as i32, m.index_count as usize, m.vertex_offset);
+        let Some(a) = self.arena.as_ref().filter(|a| a.vbo == m.vbo) else { return };
+        let (avbo, aibo) = (a.vbo, a.ibo);
+        let base = (voff / VERTEX_STRIDE) as u32;
+        // SAFETY: GL buffer work on the current context; the mapped ranges are inside the arena's
+        // buffers and unmapped before use
+        unsafe {
+            self.gl.bind_vertex_array(None);
+            self.st.vao = None;
+            let mut verts = vec![0u8; vlen];
+            let mut idx = vec![0u8; icount * 4];
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(avbo));
+            if vlen > 0 {
+                let p = self.gl.map_buffer_range(glow::ARRAY_BUFFER, voff as i32, vlen as i32, glow::MAP_READ_BIT);
+                if p.is_null() {
+                    self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                    return;
+                }
+                std::ptr::copy_nonoverlapping(p, verts.as_mut_ptr(), vlen);
+                self.gl.unmap_buffer(glow::ARRAY_BUFFER);
+            }
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            if !idx.is_empty() {
+                self.gl.bind_buffer(glow::COPY_READ_BUFFER, Some(aibo));
+                let p = self.gl.map_buffer_range(glow::COPY_READ_BUFFER, ioff, idx.len() as i32, glow::MAP_READ_BIT);
+                if p.is_null() {
+                    self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+                    return;
+                }
+                std::ptr::copy_nonoverlapping(p, idx.as_mut_ptr(), idx.len());
+                self.gl.unmap_buffer(glow::COPY_READ_BUFFER);
+                self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+            }
+            // the arena's indices are rebased onto the arena: back to the mesh's own
+            let local: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&idx).iter().map(|i| i.wrapping_sub(base)).collect();
+            let vbo = self.gl.create_buffer().expect("buffer");
+            let ibo = self.gl.create_buffer().expect("buffer");
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, if verts.is_empty() { &[0; 4] } else { &verts }, glow::STREAM_DRAW);
+            self.gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ibo));
+            let ib: &[u8] = bytemuck::cast_slice(&local);
+            self.gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, if ib.is_empty() { &[0; 4] } else { ib }, glow::STATIC_DRAW);
+            let vao = self.make_vao(vbo, ibo);
+            let m = &mut self.meshes[id as usize];
+            m.vao = vao;
+            m.vbo = vbo;
+            m.index_offset = 0;
+            m.vertex_offset = 0;
+            m.shadow = Some(verts);
         }
     }
 
@@ -891,6 +1016,13 @@ impl GlCore {
     }
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
+        self.lens_async = true;
+        let r = self.render_window(scene, camera);
+        self.lens_async = false;
+        r
+    }
+
+    fn render_window(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
         let (w, h) = self.size;
         let aspect = w as f32 / h.max(1) as f32;
         let probe = scene.lens_probe.filter(|_| self.lens_enabled);
@@ -901,7 +1033,9 @@ impl GlCore {
             self.draw_frame(scene, camera, Tgt { fbo: Some(fbo), width: w, height: h, flip: false }, scene.clear_color, true, aspect, VIEW_FAR, probe);
             self.gamma_resolve(None, w, h);
         }
+        crate::hitch::mark("gl_draw");
         self.window.gl_swap();
+        crate::hitch::mark("swap");
         self.stats_draws_report();
         Ok(())
     }
@@ -1019,17 +1153,32 @@ impl GlCore {
         };
         let (x, y) = (clamp(px, w), clamp(py, h));
         let gl_y = if tgt.flip { y } else { h - y - 4 };
+        if self.lens_async {
+            // SAFETY: a pixel-pack buffer of this context; the read is queued, not waited for
+            unsafe {
+                let pbo = match self.lens_pbos.pop() {
+                    Some(b) => b,
+                    None => {
+                        let Ok(b) = self.gl.create_buffer() else { return };
+                        self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(b));
+                        self.gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, 64, glow::STREAM_READ);
+                        b
+                    }
+                };
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo));
+                self.gl.read_pixels(x, gl_y, 4, 4, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                match self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+                    Ok(fence) => self.lens_pending.push(LensPending { pbo, fence, reference, flip: tgt.flip, pass: self.pass }),
+                    Err(_) => self.lens_pbos.push(pbo),
+                }
+            }
+            return;
+        }
         let mut block = [0u8; 64];
         // SAFETY: a read of the bound framebuffer
         unsafe { self.gl.read_pixels(x, gl_y, 4, 4, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut block))) };
-        let mut pixels = [0u32; 16];
-        for row in 0..4 {
-            let src = if tgt.flip { row } else { 3 - row };
-            for i in 0..4 {
-                let o = src * 16 + i * 4;
-                pixels[row * 4 + i] = u32::from_le_bytes([block[o], block[o + 1], block[o + 2], block[o + 3]]);
-            }
-        }
+        let pixels = lens_block_pixels(&block, tgt.flip);
         self.lens_done.push(LensRead { reference, pixels, cost_ms: t0.elapsed().as_millis() as u32 });
     }
 
@@ -1094,9 +1243,12 @@ impl GlCore {
             self.draw_bucket(scene, &buckets[0], &pass);
             self.lens_read(tgt, p, true);
         }
+        crate::hitch::mark("setup");
         self.clear(Some(clear_colour), true);
+        crate::hitch::mark("clear");
         for b in 0..3 {
             self.draw_bucket(scene, &buckets[b], &pass);
+            crate::hitch::mark(["bucket0", "bucket1", "bucket2"][b]);
         }
         if let Some(p) = probe.filter(|p| p.test) {
             self.lens_read(tgt, p, false);
@@ -1104,10 +1256,12 @@ impl GlCore {
         if !buckets[3].is_empty() {
             self.draw_bucket(scene, &buckets[3], &pass);
         }
+        crate::hitch::mark("bucket3");
         self.buckets = buckets;
         if with_sprites && !scene.sprites.is_empty() {
             self.draw_sprites(scene, aspect);
         }
+        crate::hitch::mark("sprites");
     }
 
     fn draw_bucket(&mut self, scene: &Scene, bucket: &[u32], pass: &PassCtx) {
@@ -1362,4 +1516,26 @@ fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
     };
     let (a, b, c, d) = (corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0));
     [a, b, c, a, c, d]
+}
+
+/// ReNFS5: a lens read queued into a pixel-pack buffer (`GlCore::lens_read`).
+struct LensPending {
+    pbo: glow::Buffer,
+    fence: glow::Fence,
+    reference: bool,
+    flip: bool,
+    pass: u64,
+}
+
+/// The 4 × 4 RGBA block of a lens read as the sixteen texels, top row first.
+fn lens_block_pixels(block: &[u8; 64], flip: bool) -> [u32; 16] {
+    let mut pixels = [0u32; 16];
+    for row in 0..4 {
+        let src = if flip { row } else { 3 - row };
+        for i in 0..4 {
+            let o = src * 16 + i * 4;
+            pixels[row * 4 + i] = u32::from_le_bytes([block[o], block[o + 1], block[o + 2], block[o + 3]]);
+        }
+    }
+    pixels
 }

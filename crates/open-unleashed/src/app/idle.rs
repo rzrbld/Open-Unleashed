@@ -66,6 +66,49 @@ impl App {
         }
     }
 
+    /// ReNFS5: **the frame's game time in whole display refreshes.** With vsync the picture changes
+    /// only at a refresh, but the swap returns early on some frames and late on others (Mali: 10 ms
+    /// then 23 ms at a steady 60 FPS), so the measured time moves the world unevenly against the
+    /// even refreshes — judder at 60 FPS. The time is rounded to whole refreshes, the remainder
+    /// carried (bounded to one refresh), so the long-run clock stays exact. Only while frames come
+    /// at the refresh rate or slower (an uncapped desktop at 160 FPS keeps its measured times), and
+    /// never for a real hitch (over four refreshes). `NFS5_DISPLAY_DT=0` turns it off;
+    /// `NFS5_REFRESH_HZ` overrides the display mode's rate.
+    pub(crate) fn display_dt(&self, raw: Duration) -> Duration {
+        thread_local! {
+            static S: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+        }
+        static PERIOD: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+        let period = *PERIOD.get_or_init(|| {
+            if std::env::var("NFS5_DISPLAY_DT").is_ok_and(|v| v.trim() == "0") {
+                return None;
+            }
+            let hz = std::env::var("NFS5_REFRESH_HZ").ok().and_then(|v| v.trim().parse::<f64>().ok())
+                .or_else(|| self.window.as_ref().and_then(|w| w.refresh_hz()))
+                .filter(|hz| (20.0..=500.0).contains(hz));
+            tracing::info!(refresh_hz = ?hz, "frame time in whole refreshes");
+            hz.map(|hz| 1.0 / hz)
+        });
+        let Some(t) = period else { return raw };
+        let r = raw.as_secs_f64();
+        S.with(|c| {
+            let (mut residual, mut mean) = c.get();
+            mean = if mean == 0.0 { r } else { mean * 0.9 + r * 0.1 };
+            let out = if mean < 0.9 * t || r > 4.0 * t {
+                residual = 0.0;
+                raw
+            } else {
+                let x = r + residual;
+                let n = (x / t).round().max(1.0);
+                residual = (x - n * t).clamp(-t, t);
+                Duration::from_secs_f64(n * t)
+            };
+            c.set((residual, mean));
+            display_dt_stats(if out == raw && !(mean >= 0.9 * t && r <= 4.0 * t) { 0 } else { (out.as_secs_f64() / t).round() as usize });
+            out
+        })
+    }
+
     /// Whether the window is not on screen: winit's `Occluded(true)` (covered by other windows
     /// entirely, another Space, a hidden app) or minimised. A window that is only unfocused, or
     /// partly covered, is visible and not counted.
@@ -188,4 +231,21 @@ mod tests {
         assert_eq!(frame_floor(Some(20.0), true), Some(Duration::from_secs_f64(1.0 / 20.0)));
         assert_eq!(frame_floor(Some(60.0), false), Some(Duration::from_secs_f64(1.0 / 60.0)));
     }
+}
+
+/// ReNFS5: once a second, how many frames advanced the game by 1, 2, 3+ refreshes and how many kept
+/// their measured time (`raw`) — `display_dt`'s effect, in the log.
+fn display_dt_stats(n: usize) {
+    thread_local! {
+        static C: std::cell::RefCell<(std::time::Instant, [u32; 4])> = std::cell::RefCell::new((std::time::Instant::now(), [0; 4]));
+    }
+    C.with(|c| {
+        let mut c = c.borrow_mut();
+        c.1[n.min(3)] += 1;
+        if c.0.elapsed() >= Duration::from_secs(1) {
+            let [raw, one, two, more] = c.1;
+            tracing::info!(one, two, more, raw, "game steps in refreshes");
+            *c = (std::time::Instant::now(), [0; 4]);
+        }
+    });
 }

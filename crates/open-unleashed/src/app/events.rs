@@ -827,8 +827,9 @@ impl ApplicationHandler for App {
                 // the front end draws from `rebuild_scene` like everything else, so it keeps
                 // animating between key presses
                 self.pace_frame();
+                nfs_renderer::hitch::frame_start();
                 let now = Instant::now();
-                self.frame_dt = (now - self.last_frame).as_secs_f32();
+                self.frame_dt = self.display_dt(now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
                 self.draw_frame();
                 if std::mem::take(&mut self.net.start_due) && self.net_playgame() {
@@ -909,8 +910,11 @@ impl ApplicationHandler for App {
                     self.gamepads.rumble_test_tick();
                 }
                 self.pace_frame();
+                nfs_renderer::hitch::frame_start();
                 let now = Instant::now();
-                self.frame_dt = (now - self.last_frame).as_secs_f32();
+                // ReNFS5: the frame's game time in whole display refreshes (`display_dt`)
+                let frame_time = self.display_dt(now - self.last_frame);
+                self.frame_dt = frame_time.as_secs_f32();
                 // the replay pause freezes the frame as the pause menu does: `[0x606A98]` makes
                 // `RaceFrame` render only (0x415C69) and pauses the audio (0x4AB150 / 0x4AB200,
                 // 0x41581A…0x415849)
@@ -945,7 +949,7 @@ impl ApplicationHandler for App {
                 // SFX loops.)*
                 self.sync_audio_pause();
                 self.billboard_key_frame();
-                self.accumulator += now - self.last_frame;
+                self.accumulator += frame_time;
                 self.last_frame = now;
                 if self.accumulator > Duration::from_millis(250) {
                     self.accumulator = Duration::from_millis(250);
@@ -999,6 +1003,8 @@ impl ApplicationHandler for App {
                     // the render's interpolation runs on the time since the last tick
                     self.accumulator = now.saturating_duration_since(self.exchange_tick_at).min(GAME_TICK);
                 }
+                nfs_renderer::hitch::mark("sim");
+                nfs_renderer::hitch::note(&format!("ticks={ran}"));
                 if self.race_frame_epilogue(event_loop) {
                     return;
                 }

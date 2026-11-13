@@ -21,6 +21,7 @@ pub(crate) fn point_filter() -> bool {
 }
 
 mod camera;
+pub mod hitch;
 mod front;
 mod backend;
 mod gl_core;
