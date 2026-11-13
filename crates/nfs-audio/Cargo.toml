@@ -6,11 +6,17 @@ license.workspace = true
 
 [dependencies]
 nfs-formats.workspace = true
-cpal.workspace = true
+cpal = { workspace = true, optional = true }
 sdl2-sys.workspace = true
 tracing.workspace = true
 libm.workspace = true
 anyhow.workspace = true
+
+[features]
+# ReNFS5: cpal (ALSA directly on Linux) beside the SDL2 output, and the voice chat's microphone.
+# Off in the PortMaster build: audio goes through the firmware's SDL2 only.
+default = ["cpal"]
+cpal = ["dep:cpal"]
 
 [dev-dependencies]
 nfs-assets.workspace = true

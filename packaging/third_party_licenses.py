@@ -30,6 +30,9 @@ def main():
     cmd = ["cargo", "metadata", "--format-version", "1", "--locked"]
     if "--target" in args:
         cmd += ["--filter-platform", args[args.index("--target") + 1]]
+    # ReNFS5: the PortMaster build's feature set (no cpal / ALSA)
+    if "--no-default-features" in args:
+        cmd += ["--no-default-features"]
     meta = json.loads(subprocess.run(cmd, check=True, capture_output=True, text=True).stdout)
     pkgs = {p["id"]: p for p in meta["packages"]}
     nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}

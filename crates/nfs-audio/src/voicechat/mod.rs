@@ -3,7 +3,23 @@
 //! session owns (`[net+0x14]`, built by 0x4931C0, ticked by the library-service callback 0x493320 →
 //! **0x493350**, fed by the receiver 0x493270). The `0xC1` message itself is `nfs_net::voice`.
 
+#[cfg(feature = "cpal")]
 pub mod capture;
+/// ReNFS5: no microphone without cpal (the PortMaster build): nothing is ever captured.
+#[cfg(not(feature = "cpal"))]
+pub mod capture {
+    pub const RATE: u32 = 8000;
+    pub struct Capture;
+    impl Capture {
+        pub fn open() -> Option<Capture> {
+            tracing::info!("voice chat: no microphone capture in this build (SDL2 audio only)");
+            None
+        }
+        pub fn read(&self, _out: &mut [i16; super::codec::FRAME]) -> bool {
+            false
+        }
+    }
+}
 pub mod codec;
 
 use crate::mixer::{AudioOutput, StopHandle, StreamSource, VoiceId};

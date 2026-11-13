@@ -27,6 +27,12 @@ nfs-math.workspace = true
 image.workspace = true
 nfs-audio.workspace = true
 
+[features]
+# ReNFS5: cpal (ALSA directly) beside SDL2 audio; the PortMaster build turns it off
+# (`--no-default-features`): every device then goes through the firmware's SDL2
+default = ["cpal"]
+cpal = ["nfs-audio/cpal"]
+
 [build-dependencies]
 embed-resource = "3"
 

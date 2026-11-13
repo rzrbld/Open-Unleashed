@@ -1,3 +1,4 @@
+#[cfg(feature = "cpal")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::resample::{self, Cursor, Gains, Interp};
 use crate::rt::{self, Consumer, Producer, SampleRing};

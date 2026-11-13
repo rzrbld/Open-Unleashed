@@ -29,7 +29,7 @@ nfs-assets = { path = "crates/nfs-assets" }
 nfs-math = { path = "crates/nfs-math" }
 nfs-physics = { path = "crates/nfs-physics" }
 nfs-renderer = { path = "crates/nfs-renderer" }
-nfs-audio = { path = "crates/nfs-audio" }
+nfs-audio = { path = "crates/nfs-audio", default-features = false }
 nfs-input = { path = "crates/nfs-input" }
 nfs-net = { path = "crates/nfs-net" }
 nfs-game = { path = "crates/nfs-game" }

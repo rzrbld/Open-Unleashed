@@ -72,6 +72,7 @@ impl Offline {
 /// default), else 256 on macOS (CoreAudio's default is 512), clamped to what the device supports;
 /// other systems keep their default buffer.
 // PORT-DEVIATION D2 (RE/notes/PORT-DEVIATIONS.md): a fixed 256-frame device buffer on macOS; the original's sound layer opens at 0x4A66B0 with 0x565720([0x655D44], 0x40000, 3).
+#[cfg(feature = "cpal")]
 pub(super) fn device_buffer_frames(supported: &cpal::SupportedStreamConfig) -> Option<u32> {
     let asked = std::env::var("NFS_AUDIO_BUFFER").ok().and_then(|v| v.parse::<u32>().ok());
     let n = asked.unwrap_or(if cfg!(target_os = "macos") { 256 } else { 0 });
@@ -163,6 +164,7 @@ impl Backend {
 
 /// The open device stream of an [`AudioOutput`]; dropping it stops the device callback.
 pub(super) enum Stream {
+    #[cfg(feature = "cpal")]
     Cpal(#[allow(dead_code)] cpal::Stream),
     Sdl(#[allow(dead_code)] SdlStream),
 }
@@ -347,7 +349,10 @@ impl AudioOutput {
         for (k, backend) in order.into_iter().enumerate() {
             let opened = match backend {
                 Backend::Sdl => SdlStream::open().map(|(s, tx, rate)| Self { _stream: Some(Stream::Sdl(s)), tx, rate }),
+                #[cfg(feature = "cpal")]
                 Backend::Cpal => Self::new_cpal(),
+                #[cfg(not(feature = "cpal"))]
+                Backend::Cpal => Err(anyhow::anyhow!("cpal is not built in (SDL2 audio only)")),
             };
             match opened {
                 Ok(out) => {
@@ -366,6 +371,7 @@ impl AudioOutput {
     }
 
     /// The cpal device stream: the default device at its default config.
+    #[cfg(feature = "cpal")]
     fn new_cpal() -> anyhow::Result<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
@@ -420,6 +426,7 @@ impl AudioOutput {
 
     /// The output stream whose callback is `core`'s: what the game thread queued since the last
     /// run, then the mix — nothing here takes a lock or allocates.
+    #[cfg(feature = "cpal")]
     pub(super) fn open(device: &cpal::Device, config: &cpal::StreamConfig, channels: usize, mut core: Core) -> Result<cpal::Stream, cpal::Error> {
         let out_rate = config.sample_rate as f64;
         device.build_output_stream(

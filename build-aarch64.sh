@@ -8,6 +8,6 @@ export DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/repos/renfs5/work/docker-config}
 docker run --rm -u "$(id -u):$(id -g)" \
   -v "$PWD":/src -w /src \
   -v "$HOME/.cargo/registry":/opt/cargo/registry \
-  -e CARGO_HOME=/opt/cargo \
+  -e CARGO_HOME=/opt/cargo -e CARGO_TARGET_DIR=/src/${TARGET_DIR:-target} \
   -e RUSTFLAGS="-C target-cpu=${TARGET_CPU:-cortex-a53}" \
   "$image" cargo build --release --locked -p open-unleashed --target aarch64-unknown-linux-gnu "$@"
