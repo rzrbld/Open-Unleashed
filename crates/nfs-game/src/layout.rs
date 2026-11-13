@@ -3009,6 +3009,12 @@ impl LayoutScreen {
     /// to **1** at 0x4C97DF, which with `start == end` is simply a still frame — which is what
     /// three of the four are at rest.
     fn bar_button_frame(&self, e: &nfs_formats::lay::Element, hot: bool, down: bool) -> Option<usize> {
+        // a disabled button (RACE where the screen cannot start a game) holds the template's
+        // `shapeIndex = data.startframe` still — the original's main menu shows a plain dim
+        // "RACE", not the spinning attract run, until a screen enables it
+        if self.layout.elements.iter().position(|x| std::ptr::eq(x, e)).is_some_and(|i| self.widget_disabled(i)) {
+            return Some(e.int("startframe").unwrap_or(0).max(0) as usize);
+        }
         let sep = self.attr_num(e, "seperatehovermousedown").unwrap_or(0.0) != 0.0;
         let p = match (hot, down && sep) {
             (_, true) => "hovermousedown",

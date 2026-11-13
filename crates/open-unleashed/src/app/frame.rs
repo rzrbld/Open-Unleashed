@@ -63,7 +63,11 @@ impl App {
                     let (w, h) = r.size();
                     f.set_aspect(w as f32 / h.max(1) as f32);
                     let fps = LAST_FPS.load(std::sync::atomic::Ordering::Relaxed);
-                    self.scene.sprites.extend(f.sprites(&format!("{fps} FPS"), [0.012, 0.012], 0.04, [1.0, 0.85, 0.2, 1.0]));
+                    // big (14% of the height) in the top-right corner, clear of the screens'
+                    // titles on the left; right-aligned on a fixed "000 FPS" width so it does not jitter
+                    const H: f32 = 0.14;
+                    let w = f.place("000 FPS").1 * (H / f.line_px()) / (w as f32 / h.max(1) as f32);
+                    self.scene.sprites.extend(f.sprites(&format!("{fps:>3} FPS"), [1.0 - 0.015 - w, 0.015], H, [1.0, 0.85, 0.2, 1.0]));
                 }
             });
         }
