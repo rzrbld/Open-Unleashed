@@ -498,6 +498,7 @@ impl App {
                     #[cfg(not(any(target_os = "macos", windows)))]
                     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
                 }
+                tracing::info!(at = "netlobby.rs:501", "exit");
                 event_loop.exit();
             }
         }

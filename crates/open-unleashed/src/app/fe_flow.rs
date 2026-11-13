@@ -22,6 +22,7 @@ impl App {
         match self.fe.dialog_answer.take() {
             // 0x50CC4F: "yes" to 811 is 0x4D56E0(0) — the front end is over
             Some((true, DialogFor::Quit)) => {
+                tracing::info!(at = "app/fe_flow.rs:25", "exit");
                 event_loop.exit();
                 true
             }
@@ -440,6 +441,7 @@ impl App {
                     self.hud_cfg_apply();
                 }
                 self.fe_sound(4);
+                tracing::info!(at = "app/fe_flow.rs:443", "exit");
                 event_loop.exit();
             }
             Shown::Screen(n) => {

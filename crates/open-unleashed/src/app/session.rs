@@ -256,6 +256,7 @@ impl App {
                 }
                 // a scripted run has nobody to answer it
                 if self.autotest.is_some() {
+                    tracing::info!(at = "app/session.rs:259", "exit");
                     event_loop.exit();
                     return;
                 }
@@ -275,6 +276,7 @@ impl App {
             if self.layout_sweep {
                 self.layout_sweep = false;
                 self.run_layout_sweep();
+                tracing::info!(at = "app/session.rs:278", "exit");
                 event_loop.exit();
                 return;
             }
@@ -452,6 +454,7 @@ impl App {
                     .render_to_image(&scene, &self.camera, shot_geometry().0, shot_geometry().1)
                     .expect("render");
                 image::save_buffer(&path, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8).expect("png");
+                tracing::info!(at = "app/session.rs:455", "exit");
                 event_loop.exit();
             }
             return;

@@ -60,6 +60,7 @@ impl App {
         self.stop_race_audio();
         self.sim_shutdown();
         tracing::info!("no front end (FE [0x65B298] = 0): the program ends (0x4B6FAF → 0x4B6FC0)");
+        tracing::info!(at = "app/replay.rs:63", "exit");
         event_loop.exit();
         true
     }
@@ -512,6 +513,7 @@ impl App {
             BarEvent::Quit => {
                 let left = if self.results.is_some() { self.end_finished_race() } else { self.leave_race() };
                 if !left {
+                    tracing::info!(at = "app/replay.rs:515", "exit");
                     event_loop.exit();
                 }
             }

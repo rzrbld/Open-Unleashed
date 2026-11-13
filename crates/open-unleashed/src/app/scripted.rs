@@ -557,6 +557,7 @@ impl App {
                 if !self.leave_race_as(false) {
                     tracing::info!(target: "open_unleashed::app::race_start", "network race left by a scripted pause press: no front end to return to");
                 }
+                tracing::info!(at = "app/scripted.rs:560", "exit");
                 event_loop.exit();
                 return true;
             }
@@ -580,6 +581,7 @@ impl App {
                     // race-end path does at its own `event_loop.exit()`).
                     if self.end_scripted_pause(event_loop) {
                         self.sync_audio_pause();
+                        tracing::info!(at = "app/scripted.rs:583", "exit");
                         event_loop.exit();
                         return true;
                     }
@@ -600,6 +602,7 @@ impl App {
                             self.session_next_from_fe(game_type, event_loop);
                             return true;
                         }
+                        tracing::info!(at = "app/scripted.rs:603", "exit");
                         event_loop.exit();
                         return true;
                     }
@@ -723,6 +726,7 @@ impl App {
             // finished or not (replay.md §6.2) — so a scripted run saves on its way out too.
             self.save_replay();
             // scripted runs never stay open
+            tracing::info!(at = "app/scripted.rs:726", "exit");
             event_loop.exit();
         }
         false
@@ -795,6 +799,7 @@ impl App {
             }
             self.test_alpha = None;
         }
+        tracing::info!(at = "app/scripted.rs:798", "exit");
         event_loop.exit();
     }
 

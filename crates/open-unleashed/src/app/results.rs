@@ -398,6 +398,7 @@ impl App {
                     self.paused = false;
                     self.pause_confirm = None;
                     if !self.leave_race() {
+                        tracing::info!(at = "app/results.rs:401", "exit");
                         event_loop.exit();
                     }
                 } else {

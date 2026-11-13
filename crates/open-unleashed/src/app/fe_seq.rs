@@ -215,6 +215,7 @@ impl App {
             let rgba = r.render_to_image(&scene, &self.camera, w, h).expect("render");
             image::save_buffer(format!("{dir}/f{f:03}.png"), &rgba, w, h, image::ColorType::Rgba8).expect("png");
         }
+        tracing::info!(at = "app/fe_seq.rs:218", "exit");
         event_loop.exit();
         true
     }

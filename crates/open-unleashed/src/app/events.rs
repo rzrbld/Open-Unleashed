@@ -17,7 +17,7 @@ impl App {
         };
         let Some(run) = self.intro.as_mut() else { return };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => { tracing::info!(at = "app/events.rs:20", "exit"); event_loop.exit() }
             WindowEvent::Resized(size) => run.renderer.resize(size.width, size.height),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 tracing::info!(key = ?event.physical_key, "intro: key");
@@ -86,6 +86,7 @@ impl App {
                     self.paused = false;
                     self.pause_confirm = None;
                     if !self.leave_race() {
+                        tracing::info!(at = "app/events.rs:89", "exit");
                         event_loop.exit();
                     }
                 }
@@ -216,6 +217,7 @@ impl App {
                 self.pause_sel = 0;
                 self.pause_confirm = None;
             } else {
+                tracing::info!(at = "app/events.rs:219", "exit");
                 event_loop.exit();
             }
         }
@@ -343,7 +345,7 @@ impl ApplicationHandler for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => { tracing::info!(at = "app/events.rs:346", "exit"); event_loop.exit() }
             // Focus lost = the original's WM_ACTIVATE deactivation (0x53B050, registered for message 6 at 0x53AD66):
             // LOWORD(wParam) == 0 or HIWORD != 0 -> ShowCursor(1) (0x53B113) and memset(0x5DE028, 0, 0x80)
             // (0x53B119..0x53B125) = the key-down table forgets every key. Focus regained: the original
@@ -752,6 +754,11 @@ impl ApplicationHandler for App {
                 // timers, so the `b` of 0x4D2970 comes from the keyboard only and no pad button
                 // goes back on a layout screen. (The pad's other keys are the port's own on both.)
                 let text_menu = self.fe.layout_preview.is_none();
+                // TEST GLUE (ReNFS5): `NFS_TEST_PADNAV=ms:Key,ms:Key…` — pad menu keys at those times
+                test_padnav(&mut self.input.pad_menu);
+                if !self.input.pad_menu.is_empty() {
+                    tracing::debug!(keys = ?self.input.pad_menu, "front end: pad keys");
+                }
                 // ReNFS5: an input dialog (the player's name) takes the pad as a letter wheel
                 if self.pad_text_entry(event_loop) {
                     self.input.pad_menu.clear();
@@ -1143,7 +1150,18 @@ impl App {
                     self.pad_type(event_loop, key, Some(&t));
                 }
                 nfs_input::MenuNav::Left | nfs_input::MenuNav::Back => self.pad_type(event_loop, Key::Named(NamedKey::Backspace), None),
-                nfs_input::MenuNav::Start => self.pad_type(event_loop, Key::Named(NamedKey::Enter), Some("\r")),
+                nfs_input::MenuNav::Start => {
+                    self.pad_type(event_loop, Key::Named(NamedKey::Enter), Some("\r"));
+                    // the name typed, Start also presses the screen's OK — `createplayer`'s
+                    // `ID_CREATEPLAYEROKBUTTON` (`CREATEPLAYERDONE`), as a keyboard player clicks it
+                    let ok = self.fe.layout_preview.as_ref().and_then(|l| l.controls().iter().position(|c| c.callback.as_deref() == Some("CREATEPLAYERDONE")));
+                    if let Some(i) = ok {
+                        tracing::info!("pad: Start presses the player screen's OK");
+                        self.fe.layout_sel = i;
+                        self.layout_key(MenuKey::Enter, event_loop);
+                        break;
+                    }
+                }
                 _ => {}
             }
             if self.pad_text_target().is_none() {
@@ -1152,4 +1170,35 @@ impl App {
         }
         true
     }
+}
+
+/// TEST GLUE (ReNFS5): `NFS_TEST_PADNAV=1500:Up,2000:Right,…` — pad menu keys (`MenuNav` names) pushed
+/// at those milliseconds after the first front-end frame, for checking the pad paths without a pad.
+fn test_padnav(out: &mut Vec<nfs_input::MenuNav>) {
+    use nfs_input::MenuNav as N;
+    thread_local! {
+        static SCRIPT: std::cell::RefCell<Option<(std::time::Instant, Vec<(u64, N)>)>> = const { std::cell::RefCell::new(None) };
+    }
+    SCRIPT.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.is_none() {
+            let Ok(v) = std::env::var("NFS_TEST_PADNAV") else { return };
+            let list = v.split(',').filter_map(|e| {
+                let (t, k) = e.split_once(':')?;
+                let k = match k.trim() {
+                    "Up" => N::Up, "Down" => N::Down, "Left" => N::Left, "Right" => N::Right, "Select" => N::Select,
+                    "Back" => N::Back, "Start" => N::Start, "L1" => N::L1, "R1" => N::R1, _ => return None,
+                };
+                Some((t.trim().parse().ok()?, k))
+            }).collect();
+            *c = Some((std::time::Instant::now(), list));
+        }
+        let Some((t0, list)) = c.as_mut() else { return };
+        let now = t0.elapsed().as_millis() as u64;
+        while list.first().is_some_and(|(t, _)| *t <= now) {
+            let (_, k) = list.remove(0);
+            tracing::info!(key = ?k, "test: pad key");
+            out.push(k);
+        }
+    });
 }

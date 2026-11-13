@@ -151,6 +151,7 @@ impl App {
     /// The press, then the leave it asks for (0x41523A → the session loop's front-end return).
     pub(crate) fn net_pause_action(&mut self, event_loop: &ActiveEventLoop) {
         if self.net_pause_press() && !self.leave_race_as(false) {
+            tracing::info!(at = "app/net.rs:154", "exit");
             event_loop.exit();
         }
     }
