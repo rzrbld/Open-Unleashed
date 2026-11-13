@@ -752,6 +752,16 @@ impl ApplicationHandler for App {
                 // timers, so the `b` of 0x4D2970 comes from the keyboard only and no pad button
                 // goes back on a layout screen. (The pad's other keys are the port's own on both.)
                 let text_menu = self.fe.layout_preview.is_none();
+                // ReNFS5: an input dialog (the player's name) takes the pad as a letter wheel
+                if self.pad_name_entry() {
+                    self.input.pad_menu.clear();
+                }
+                // ReNFS5: the d-pad means focus mode — A is Enter on the focused widget; the stick
+                // means pointer mode — A is the click (`pad_pointer`), never both
+                if self.input.pad_menu.iter().any(|k| matches!(k, nfs_input::MenuNav::Up | nfs_input::MenuNav::Down | nfs_input::MenuNav::Left | nfs_input::MenuNav::Right)) {
+                    PAD_POINTER.with(|c| c.borrow_mut().focus_mode = true);
+                }
+                let focus_mode = !nfs_input::gamepad::pad_mouse_on() || PAD_POINTER.with(|c| c.borrow().focus_mode);
                 let mut keys: Vec<MenuKey> = self
                     .input
                     .pad_menu
@@ -762,7 +772,8 @@ impl ApplicationHandler for App {
                             nfs_input::MenuNav::Down => MenuKey::Down,
                             nfs_input::MenuNav::Left => MenuKey::Left,
                             nfs_input::MenuNav::Right => MenuKey::Right,
-                            nfs_input::MenuNav::Select => MenuKey::Enter,
+                            nfs_input::MenuNav::Select if focus_mode => MenuKey::Enter,
+                            nfs_input::MenuNav::Select => return None,
                             nfs_input::MenuNav::Back if text_menu => MenuKey::Back,
                             // Y and X are the race's dialog keys (PAD-END2), not the menus'
                             nfs_input::MenuNav::Back | nfs_input::MenuNav::Alt | nfs_input::MenuNav::Aux => return None,
@@ -987,10 +998,12 @@ struct PadPointer {
     pos: Option<(f64, f64)>,
     last: std::time::Instant,
     a: bool,
+    /// the d-pad was used last: A is Enter on the focus, not a click
+    focus_mode: bool,
 }
 
 thread_local! {
-    static PAD_POINTER: std::cell::RefCell<PadPointer> = std::cell::RefCell::new(PadPointer { pos: None, last: std::time::Instant::now(), a: false });
+    static PAD_POINTER: std::cell::RefCell<PadPointer> = std::cell::RefCell::new(PadPointer { pos: None, last: std::time::Instant::now(), a: false, focus_mode: false });
 }
 
 impl App {
@@ -1020,6 +1033,11 @@ impl App {
             c.last = now;
             let mut pos = c.pos.unwrap_or((sw / 2.0, sh / 2.0));
             let moved = fx != 0.0 || fy != 0.0 || c.pos.is_none();
+            if fx != 0.0 || fy != 0.0 {
+                c.focus_mode = false;
+            }
+            // in focus mode A is the focused widget's Enter (the menu keys), not a click
+            let a = a && !c.focus_mode;
             if moved {
                 let k = speed * sh / 480.0 * dt;
                 pos = ((pos.0 + fx * k).clamp(0.0, sw - 1.0), (pos.1 + fy * k).clamp(0.0, sh - 1.0));
@@ -1040,5 +1058,49 @@ impl App {
         if release {
             self.window_event(event_loop, id, WindowEvent::MouseInput { device_id, state: ElementState::Released, button: MouseButton::Left });
         }
+    }
+}
+
+/// ReNFS5: the pad's letters for a name, in the order the wheel turns.
+const NAME_WHEEL: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
+
+impl App {
+    /// ReNFS5: an input dialog's field from the pad (a handheld has no keyboard): up / down turn the
+    /// last letter through [`NAME_WHEEL`] (digits only in a digits field), right adds a letter,
+    /// left takes one off, A is the dialog's Enter. `true` when a field took the pad's keys.
+    pub(crate) fn pad_name_entry(&mut self) -> bool {
+        let Some((d, _)) = self.fe.dialog.as_mut() else { return false };
+        if !d.up {
+            return false;
+        }
+        let Some(f) = d.field.as_ref() else { return false };
+        let digits = f.digits;
+        let wheel: Vec<char> = if digits { "0123456789".chars().collect() } else { NAME_WHEEL.chars().collect() };
+        let keys = self.input.pad_menu.clone();
+        let mut sound = None;
+        for k in keys {
+            let text = d.field.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+            match k {
+                nfs_input::MenuNav::Up | nfs_input::MenuNav::Down => {
+                    let step = if k == nfs_input::MenuNav::Up { wheel.len() - 1 } else { 1 };
+                    match text.chars().last() {
+                        None => sound = d.type_char(wheel[0]).or(sound),
+                        Some(c) => {
+                            let i = wheel.iter().position(|w| *w == c.to_ascii_uppercase()).unwrap_or(0);
+                            d.backspace();
+                            sound = d.type_char(wheel[(i + step) % wheel.len()]).or(sound);
+                        }
+                    }
+                }
+                nfs_input::MenuNav::Right => sound = d.type_char(wheel[0]).or(sound),
+                nfs_input::MenuNav::Left => sound = d.backspace().or(sound),
+                nfs_input::MenuNav::Select => sound = d.enter().or(sound),
+                _ => {}
+            }
+        }
+        if let Some(n) = sound {
+            self.fe_sound(n as usize);
+        }
+        true
     }
 }
